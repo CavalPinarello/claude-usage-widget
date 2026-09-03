@@ -3,8 +3,22 @@
 # Flags: --json (raw API response)  --bar (one-line, statusline friendly)
 set -euo pipefail
 
-CREDS=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || {
-  echo "No Claude Code login in Keychain." >&2; exit 1; }
+# Several items share the service name "Claude Code-credentials": an `unknown`
+# stub with empty tokens sits alongside the real one keyed by the short user
+# name, and an unpinned lookup returns whichever comes first. Take the first
+# blob that actually carries a token.
+CREDS=""
+for ACCT in "$(id -un)" ""; do
+  if [ -n "$ACCT" ]; then
+    C=$(security find-generic-password -s "Claude Code-credentials" -a "$ACCT" -w 2>/dev/null) || continue
+  else
+    C=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || continue
+  fi
+  if printf '%s' "$C" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("claudeAiOauth",{}).get("accessToken") else 1)' 2>/dev/null; then
+    CREDS="$C"; break
+  fi
+done
+[ -n "$CREDS" ] || { echo "No Claude Code login in Keychain." >&2; exit 1; }
 
 RESP=$(python3 - "$CREDS" <<'PY'
 import json, sys, urllib.request, urllib.error

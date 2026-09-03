@@ -67,31 +67,48 @@ enum UsageFetcher {
         set { holdLock.lock(); _holdUntil = newValue; holdLock.unlock() }
     }
 
-    /// Reads the OAuth blob Claude Code stores in the login Keychain.
+    /// Runs `security find-generic-password`, optionally pinned to one account.
     /// Shells out to /usr/bin/security on purpose: that binary already holds the
     /// ACL grant, so this never triggers a "wants to access" prompt of its own.
-    private static func credentials() throws -> (token: String, expires: Date, tier: String, plan: String) {
+    private static func readItem(account: String?) -> Data? {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        proc.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        var args = ["find-generic-password", "-s", "Claude Code-credentials"]
+        if let account = account { args += ["-a", account] }
+        args.append("-w")
+        proc.arguments = args
         let out = Pipe(), err = Pipe()
         proc.standardOutput = out
         proc.standardError = err
-        do { try proc.run() } catch { throw UsageError.noCredentials }
+        do { try proc.run() } catch { return nil }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         proc.waitUntilExit()
-        guard proc.terminationStatus == 0, !data.isEmpty else { throw UsageError.noCredentials }
+        guard proc.terminationStatus == 0, !data.isEmpty else { return nil }
+        return data
+    }
 
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = root["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String
-        else { throw UsageError.noCredentials }
+    /// Reads the OAuth blob Claude Code stores in the login Keychain.
+    private static func credentials() throws -> (token: String, expires: Date, tier: String, plan: String) {
+        // Several items can share the service name "Claude Code-credentials"
+        // (an `unknown` stub with empty tokens sits alongside the real one keyed
+        // by the macOS short user name). An unpinned lookup returns whichever
+        // comes first, so try the user's own item, then the unpinned lookup, and
+        // take the first blob that actually carries a token.
+        for account in [NSUserName(), nil] {
+            guard let data = readItem(account: account),
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let oauth = root["claudeAiOauth"] as? [String: Any],
+                  let token = oauth["accessToken"] as? String,
+                  !token.isEmpty
+            else { continue }
 
-        let ms = (oauth["expiresAt"] as? Double) ?? 0
-        let expires = Date(timeIntervalSince1970: ms / 1000)
-        let tier = (oauth["rateLimitTier"] as? String) ?? ""
-        let plan = (oauth["subscriptionType"] as? String) ?? ""
-        return (token, expires, tier, plan)
+            let ms = (oauth["expiresAt"] as? Double) ?? 0
+            return (token,
+                    Date(timeIntervalSince1970: ms / 1000),
+                    (oauth["rateLimitTier"] as? String) ?? "",
+                    (oauth["subscriptionType"] as? String) ?? "")
+        }
+        throw UsageError.noCredentials
     }
 
     static func fetch(completion: @escaping (Snapshot) -> Void) {
