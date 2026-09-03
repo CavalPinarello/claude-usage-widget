@@ -1,0 +1,77 @@
+#!/bin/bash
+# Prints Claude usage in the terminal. Same source the menu bar widget uses.
+# Flags: --json (raw API response)  --bar (one-line, statusline friendly)
+set -euo pipefail
+
+CREDS=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || {
+  echo "No Claude Code login in Keychain." >&2; exit 1; }
+
+RESP=$(python3 - "$CREDS" <<'PY'
+import json, sys, urllib.request, urllib.error
+creds = json.loads(sys.argv[1])["claudeAiOauth"]
+req = urllib.request.Request(
+    "https://api.anthropic.com/api/oauth/usage",
+    headers={"Authorization": "Bearer " + creds["accessToken"],
+             "anthropic-beta": "oauth-2025-04-20",
+             "Content-Type": "application/json"})
+try:
+    print(urllib.request.urlopen(req, timeout=12).read().decode())
+except urllib.error.HTTPError as e:
+    hint = {401: "open Claude Code to refresh the login",
+            403: "open Claude Code to refresh the login",
+            429: "rate limited, retry in %ss" % (e.headers.get("Retry-After") or "60")}.get(e.code, "")
+    sys.stderr.write("HTTP %s%s\n" % (e.code, " - " + hint if hint else "")); sys.exit(1)
+PY
+)
+
+case "${1:-}" in
+  --json) echo "$RESP" | python3 -m json.tool; exit 0;;
+esac
+
+MODE="${1:-full}" python3 - "$RESP" <<'PY'
+import json, os, sys, datetime
+d = json.loads(sys.argv[1])
+mode = os.environ.get("MODE", "full")
+
+def when(s):
+    if not s: return "no reset"
+    t = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    t = (t + datetime.timedelta(microseconds=500000)).replace(microsecond=0)
+    secs = (t - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    if secs <= 0: return "resetting"
+    dd, hh, mm = int(secs)//86400, (int(secs)%86400)//3600, (int(secs)%3600)//60
+    rel = f"{dd}d {hh}h" if dd else (f"{hh}h {mm}m" if hh else f"{mm}m")
+    return f"resets in {rel} ({t.astimezone().strftime('%a %H:%M')})"
+
+rows = []
+for l in d.get("limits", []):
+    k = l.get("kind")
+    if k == "session":       name = "Session (5h)"
+    elif k == "weekly_all":  name = "Week (all)"
+    elif k == "weekly_scoped":
+        sc = (l.get("scope") or {}).get("model") or {}
+        if not l.get("percent"): continue
+        name = "Week (%s)" % (sc.get("display_name") or "scoped")
+    else: continue
+    rows.append((name, float(l.get("percent") or 0), when(l.get("resets_at")), l.get("is_active")))
+
+if mode == "--bar":
+    s = next((r for r in rows if r[0].startswith("Session")), None)
+    w = next((r for r in rows if r[0].startswith("Week (all)")), None)
+    print("session %d%% | week %d%% left" % (100-(s[1] if s else 0), 100-(w[1] if w else 0)))
+    sys.exit()
+
+W = 24
+print()
+for name, pct, reset, active in rows:
+    fill = int(round(W * pct / 100))
+    dot = "\033[32m*\033[0m " if active else "  "
+    col = "\033[32m" if pct < 60 else ("\033[33m" if pct < 80 else "\033[31m")
+    bar = col + "#"*fill + "\033[0m" + "."*(W-fill)
+    print(f"  {dot}{name:<16} [{bar}] {100-pct:>3.0f}% left   {reset}")
+sp = d.get("spend") or {}
+if sp.get("enabled"):
+    print("    %-16s $%.2f of $%.0f used" % ("Extra credits",
+          sp["used"]["amount_minor"]/100, sp["limit"]["amount_minor"]/100))
+print()
+PY
