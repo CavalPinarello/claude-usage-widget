@@ -80,18 +80,22 @@ session hits its limit). Ten open Claude Code sessions plus this widget can trip
 it together. Two things bite:
 
 - **A request made during the hold re-arms the window**, so a naive poll can
-  stay 429'd indefinitely. Measured 2026-09-04: once tripped, the block clears
-  after roughly 2.5 minutes of complete silence.
+  stay 429'd indefinitely. Measured 2026-09-04: a 2-minute poll kept the block
+  armed for as long as it ran; it cleared after 2.5-5 minutes of complete
+  silence.
 - The `Retry-After` header is not a usable hint. It used to say `65`; it now
   says `0`, which would tell a naive client to retry immediately, forever.
 
-So the widget treats a 429 as a strike and backs off 2 → 4 → 8 → 15 minutes
-(honouring a larger `Retry-After` if one ever appears), makes no network call
-at all until the hold expires, and resets the strike count on the next 200.
-While it is holding, the panel keeps the last good numbers, turns the banner
-amber, and says "next try 2:58 PM" rather than counting down. Base interval is
-120 seconds, plus a refresh on menu open (throttled to one per 30s) and on wake
-from sleep. If you fork this, keep that behaviour.
+So the widget polls every 5 minutes, treats a 429 as a strike and backs off
+5 → 10 → 15 minutes (honouring a larger `Retry-After` if one ever appears),
+makes no network call at all until the hold expires, and resets the strike
+count on the next 200. While it is holding, the panel keeps the last good
+numbers, turns the banner amber, and says "next try 2:58 PM" rather than
+counting down. Opening the menu refreshes at most once per 2 minutes; ⌘R
+forces a fetch unless a hold is active; waking from sleep refreshes too. Every
+network outcome is logged as one line in `~/Library/Logs/ClaudeUsage.log`
+(status, strike, hold; never numbers or tokens). If you fork this, keep that
+behaviour.
 
 ## Terminal companion
 

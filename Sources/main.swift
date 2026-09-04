@@ -75,16 +75,39 @@ enum UsageFetcher {
     /// How long to stay off the endpoint after a 429. The limiter is shared
     /// with Claude Code's own usage calls, and every request made while it is
     /// armed re-arms it, so the hold must be long enough to actually clear it.
-    /// Cloudflare now answers `Retry-After: 0`, which is useless as a hint:
-    /// measured 2026-09-04, the block clears after ~2.5 min of silence. So:
-    /// honour a real Retry-After if it is larger, otherwise 2 → 4 → 8 → 15 min.
+    /// Cloudflare now answers `Retry-After: 0`, which is useless as a hint.
+    /// Measured 2026-09-04: a 2-minute poll kept the block armed indefinitely;
+    /// it cleared after 2.5-5 min of silence. So: honour a real Retry-After if
+    /// it is larger, otherwise 5 → 10 → 15 min.
     private static func holdSeconds(advertised: Double, strike: Int) -> TimeInterval {
-        let backoff = min(900, 120 * pow(2, Double(max(0, strike - 1))))
+        let backoff = min(900, 300 * pow(2, Double(max(0, strike - 1))))
         return max(advertised + 3, backoff)
     }
 
     static func rateLimitMessage(until: Date) -> String {
         "Usage API rate limited \u{2013} next try \(Style.clock(until))"
+    }
+
+    /// Appends one line per network outcome to ~/Library/Logs/ClaudeUsage.log
+    /// (kept under ~200 KB). No numbers or tokens, just status and timing.
+    private static let logURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/ClaudeUsage.log")
+    private static let logFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"; return f
+    }()
+    static func log(_ line: String) {
+        let text = "\(logFormatter.string(from: Date())) \(line)\n"
+        guard let data = text.data(using: .utf8) else { return }
+        let fm = FileManager.default
+        if let attrs = try? fm.attributesOfItem(atPath: logURL.path),
+           let size = attrs[.size] as? Int, size > 200_000 {
+            try? fm.removeItem(at: logURL)
+        }
+        if let h = try? FileHandle(forWritingTo: logURL) {
+            h.seekToEndOfFile(); h.write(data); try? h.close()
+        } else {
+            try? data.write(to: logURL)
+        }
     }
 
     /// Reads the OAuth blob Claude Code stores in the login Keychain.
@@ -149,18 +172,25 @@ enum UsageFetcher {
             var s = Snapshot()
             s.plan = prettyPlan(plan: creds.plan, tier: creds.tier)
 
-            if let error = error { s.error = error.localizedDescription; return completion(s) }
+            if let error = error {
+                log("transport error: \(error.localizedDescription)")
+                s.error = error.localizedDescription; return completion(s)
+            }
             let http = response as? HTTPURLResponse
             let code = http?.statusCode ?? 0
             if code == 429 {
-                let advertised = Double(http?.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 0
+                let header = http?.value(forHTTPHeaderField: "Retry-After") ?? ""
+                let advertised = Double(header) ?? 0
                 strikes += 1
-                let until = Date().addingTimeInterval(holdSeconds(advertised: advertised, strike: strikes))
+                let secs = holdSeconds(advertised: advertised, strike: strikes)
+                let until = Date().addingTimeInterval(secs)
                 holdUntil = until
+                log("429 retry-after=\(header.isEmpty ? "-" : header) strike=\(strikes) hold=\(Int(secs))s")
                 s.error = rateLimitMessage(until: until)
                 return completion(s)
             }
             guard (200..<300).contains(code) else {
+                log("HTTP \(code)")
                 s.error = UsageError.http(code).errorDescription
                 return completion(s)
             }
@@ -171,6 +201,7 @@ enum UsageFetcher {
             s.gauges = parseGauges(json)
             s.extra = parseExtra(json)
             s.fetchedAt = Date()
+            log("200 after \(strikes) strike(s)")
             strikes = 0
             if s.gauges.isEmpty { s.error = UsageError.badPayload.errorDescription }
             completion(s)
@@ -566,9 +597,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         refresh()
-        // 120s: the endpoint's limiter is shared with Claude Code's own calls
-        // and takes ~2.5 min of silence to clear once tripped, so poll slowly.
-        timer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in
+        // 5 min: the endpoint's limiter is shared with Claude Code's own calls,
+        // and a 2-minute cadence was measured to keep it armed once tripped.
+        timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             self?.refresh()
         }
         timer?.tolerance = 10
@@ -624,7 +655,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refresh(force: Bool = false) {
         // The usage endpoint 429s under rapid polling; menu opens are throttled.
-        if !force && Date().timeIntervalSince(lastFetchStarted) < 30 { return }
+        // ⌘R still forces a fetch, but a backoff hold blocks even that.
+        if !force && Date().timeIntervalSince(lastFetchStarted) < 120 { return }
         lastFetchStarted = Date()
 
         UsageFetcher.fetch { [weak self] snap in
