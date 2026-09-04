@@ -73,13 +73,25 @@ It is a single ~660-line Swift file. Read it.
 
 ## Rate limiting
 
-The usage endpoint sits behind a tight sliding-window limiter. It answers 429
-with `Retry-After: 65`, and — the part that bites — **a request made during the
-hold re-arms the window**, so a naive 30-second poll can stay 429'd indefinitely.
+The usage endpoint sits behind a tight sliding-window limiter at the Cloudflare
+edge, and the budget is **shared with Claude Code's own calls** to the same
+endpoint (it fetches usage on startup, for extra-usage checks, and when a
+session hits its limit). Ten open Claude Code sessions plus this widget can trip
+it together. Two things bite:
 
-The widget parses `Retry-After` and makes no network call at all until the hold
-expires. Base interval is 90 seconds, plus a refresh on menu open (throttled to
-one per 30s) and on wake from sleep. If you fork this, keep that behaviour.
+- **A request made during the hold re-arms the window**, so a naive poll can
+  stay 429'd indefinitely. Measured 2026-09-04: once tripped, the block clears
+  after roughly 2.5 minutes of complete silence.
+- The `Retry-After` header is not a usable hint. It used to say `65`; it now
+  says `0`, which would tell a naive client to retry immediately, forever.
+
+So the widget treats a 429 as a strike and backs off 2 → 4 → 8 → 15 minutes
+(honouring a larger `Retry-After` if one ever appears), makes no network call
+at all until the hold expires, and resets the strike count on the next 200.
+While it is holding, the panel keeps the last good numbers, turns the banner
+amber, and says "next try 2:58 PM" rather than counting down. Base interval is
+120 seconds, plus a refresh on menu open (throttled to one per 30s) and on wake
+from sleep. If you fork this, keep that behaviour.
 
 ## Terminal companion
 
@@ -102,7 +114,7 @@ statusline.
 ```sh
 ./build.sh                                     # compile, sign, relaunch
 "$HOME/Applications/Claude Usage.app/Contents/MacOS/ClaudeUsage" \
-    --snapshot out.png [--demo] [--dark]       # render the dropdown panel
+    --snapshot out.png [--demo [--stale]] [--dark]  # render the dropdown panel
     --icon out.png [--dark]                    # render the menu bar item
 ```
 

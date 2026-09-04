@@ -45,7 +45,7 @@ enum UsageError: LocalizedError {
         case .noCredentials:   return "No Claude Code login found in Keychain"
         case .tokenExpired:    return "Login expired \u{2013} open Claude Code to refresh"
         case .http(401), .http(403): return "Login rejected \u{2013} open Claude Code to refresh"
-        case .http(429):       return "Rate limited by the usage API \u{2013} retrying"
+        case .http(429):       return "Usage API rate limited \u{2013} will retry"
         case .http(let c):     return "Usage API returned HTTP \(c)"
         case .badPayload:      return "Could not read the usage response"
         }
@@ -62,9 +62,29 @@ enum UsageFetcher {
 
     private static let holdLock = NSLock()
     private static var _holdUntil = Date.distantPast
+    private static var _strikes = 0          // consecutive 429s, reset on success
     private static var holdUntil: Date {
         get { holdLock.lock(); defer { holdLock.unlock() }; return _holdUntil }
         set { holdLock.lock(); _holdUntil = newValue; holdLock.unlock() }
+    }
+    private static var strikes: Int {
+        get { holdLock.lock(); defer { holdLock.unlock() }; return _strikes }
+        set { holdLock.lock(); _strikes = newValue; holdLock.unlock() }
+    }
+
+    /// How long to stay off the endpoint after a 429. The limiter is shared
+    /// with Claude Code's own usage calls, and every request made while it is
+    /// armed re-arms it, so the hold must be long enough to actually clear it.
+    /// Cloudflare now answers `Retry-After: 0`, which is useless as a hint:
+    /// measured 2026-09-04, the block clears after ~2.5 min of silence. So:
+    /// honour a real Retry-After if it is larger, otherwise 2 → 4 → 8 → 15 min.
+    private static func holdSeconds(advertised: Double, strike: Int) -> TimeInterval {
+        let backoff = min(900, 120 * pow(2, Double(max(0, strike - 1))))
+        return max(advertised + 3, backoff)
+    }
+
+    static func rateLimitMessage(until: Date) -> String {
+        "Usage API rate limited \u{2013} next try \(Style.clock(until))"
     }
 
     /// Reads the OAuth blob Claude Code stores in the login Keychain.
@@ -100,7 +120,7 @@ enum UsageFetcher {
         let hold = holdUntil
         if hold > Date() {
             var s = Snapshot()
-            s.error = "Rate limited \u{2013} retrying in \(Int(hold.timeIntervalSinceNow.rounded()))s"
+            s.error = rateLimitMessage(until: hold)
             return completion(s)
         }
 
@@ -133,9 +153,11 @@ enum UsageFetcher {
             let http = response as? HTTPURLResponse
             let code = http?.statusCode ?? 0
             if code == 429 {
-                let secs = Double(http?.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 65
-                holdUntil = Date().addingTimeInterval(secs + 3)
-                s.error = "Rate limited \u{2013} retrying in \(Int(secs))s"
+                let advertised = Double(http?.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 0
+                strikes += 1
+                let until = Date().addingTimeInterval(holdSeconds(advertised: advertised, strike: strikes))
+                holdUntil = until
+                s.error = rateLimitMessage(until: until)
                 return completion(s)
             }
             guard (200..<300).contains(code) else {
@@ -149,6 +171,7 @@ enum UsageFetcher {
             s.gauges = parseGauges(json)
             s.extra = parseExtra(json)
             s.fetchedAt = Date()
+            strikes = 0
             if s.gauges.isEmpty { s.error = UsageError.badPayload.errorDescription }
             completion(s)
         }.resume()
@@ -372,9 +395,11 @@ final class PanelView: NSView {
         if let err = snapshot.error {
             y -= 34
             let box = NSRect(x: pad, y: y, width: W - pad * 2, height: 30)
-            NSColor.systemRed.withAlphaComponent(0.10).setFill()
+            // Red means "no numbers"; amber means "numbers shown, but stale".
+            let tint: NSColor = snapshot.stale ? .systemOrange : .systemRed
+            tint.withAlphaComponent(0.10).setFill()
             NSBezierPath(roundedRect: box, xRadius: 6, yRadius: 6).fill()
-            draw(err, font: .systemFont(ofSize: 11), color: .systemRed, lines: 2,
+            draw(err, font: .systemFont(ofSize: 11), color: tint, lines: 2,
                  in: box.insetBy(dx: 9, dy: 5))
             y -= 4
         }
@@ -541,7 +566,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 90, repeats: true) { [weak self] _ in
+        // 120s: the endpoint's limiter is shared with Claude Code's own calls
+        // and takes ~2.5 min of silence to clear once tripped, so poll slowly.
+        timer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in
             self?.refresh()
         }
         timer?.tolerance = 10
@@ -711,6 +738,12 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
             Gauge(key: "weekly_opus", label: "Week \u{00B7} Opus", percentUsed: 56,
                   resetsAt: Date().addingTimeInterval(3.4 * 86400), isActive: false),
         ]
+        if CommandLine.arguments.contains("--stale") {
+            // Preview the rate-limited state: last good numbers + amber banner.
+            snap.fetchedAt = Date().addingTimeInterval(-11 * 60)
+            snap.stale = true
+            snap.error = UsageFetcher.rateLimitMessage(until: Date().addingTimeInterval(4 * 60))
+        }
     } else {
         let sema = DispatchSemaphore(value: 0)
         UsageFetcher.fetch { snap = $0; sema.signal() }

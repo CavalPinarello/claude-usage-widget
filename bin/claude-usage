@@ -19,7 +19,8 @@ try:
 except urllib.error.HTTPError as e:
     hint = {401: "open Claude Code to refresh the login",
             403: "open Claude Code to refresh the login",
-            429: "rate limited, retry in %ss" % (e.headers.get("Retry-After") or "60")}.get(e.code, "")
+            429: "rate limited (the limiter is shared with Claude Code's own usage calls); "
+                 "leave it alone for ~2-3 minutes, every request meanwhile re-arms it"}.get(e.code, "")
     sys.stderr.write("HTTP %s%s\n" % (e.code, " - " + hint if hint else "")); sys.exit(1)
 PY
 )
