@@ -3,7 +3,7 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$DIR/Sources/main.swift"
+SRC="$DIR/Sources"
 APP="$HOME/Applications/Claude Usage.app"
 MACOS="$APP/Contents/MacOS"
 RES="$APP/Contents/Resources"
@@ -23,7 +23,7 @@ mkdir -p "$MACOS" "$RES"
 # Pin the deployment target so the compiler enforces macOS 13 availability.
 swiftc -O -target "$(uname -m)-apple-macos13.0" \
   -framework Cocoa \
-  -o "$MACOS/ClaudeUsage" "$SRC"
+  -o "$MACOS/ClaudeUsage" "$SRC"/*.swift
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

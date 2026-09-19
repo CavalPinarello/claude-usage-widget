@@ -322,6 +322,16 @@ enum Style {
         }
     }
 
+    /// Mac health colour. The panel and menu bar apply it only when the level
+    /// is not ok, so a healthy machine adds no colour at all.
+    static func tint(forHealth level: HealthLevel) -> NSColor {
+        switch level {
+        case .ok:       return .systemGreen
+        case .warn:     return .systemYellow
+        case .critical: return .systemRed
+        }
+    }
+
     static func countdown(to date: Date?) -> String {
         guard let date = date else { return "no reset scheduled" }
         let secs = date.timeIntervalSinceNow
@@ -389,17 +399,26 @@ final class PanelView: NSView {
 
     var snapshot = Snapshot() { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
 
+    // Mac health section: appears once the first sample is in.
+    private let healthRowH: CGFloat = 36
+    private let healthHeaderH: CGFloat = 30
+    var healthState = HealthPanelState() { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
+    private var health: HealthAssessment? { healthState.assessment }
+
     private var rowCount: Int {
         var n = snapshot.gauges.count
         if let e = snapshot.extra, e.enabled { n += 1 }
         return n
     }
 
+    private var healthRowCount: Int { health == nil ? 0 : 4 }
+
     override var intrinsicContentSize: NSSize {
         var h = pad + 20 + 8                       // header
         h += CGFloat(rowCount) * rowH
         if snapshot.error != nil { h += 38 }
         if rowCount == 0 && snapshot.error == nil { h += 34 }
+        if health != nil { h += healthHeaderH + CGFloat(healthRowCount) * healthRowH }
         h += 24 + pad                              // footer
         return NSSize(width: PanelView.width, height: h)
     }
@@ -462,6 +481,23 @@ final class PanelView: NSView {
                  in: NSRect(x: pad, y: y, width: W - pad * 2, height: 20))
         }
 
+        // Mac health
+        if let h = health {
+            y -= healthHeaderH
+            draw("MAC", font: .systemFont(ofSize: 10, weight: .semibold),
+                 color: .secondaryLabelColor, kern: 0.9,
+                 in: NSRect(x: pad, y: y + 4, width: W - pad * 2, height: 15))
+            if h.level != .ok, let top = h.reasons.first {
+                draw(top, font: .systemFont(ofSize: 10, weight: .semibold),
+                     color: Style.tint(forHealth: h.level), align: .right,
+                     in: NSRect(x: pad, y: y + 4, width: W - pad * 2, height: 15))
+            }
+            for row in healthRows(h) {
+                y -= healthRowH
+                drawKeyValueRow(row, in: NSRect(x: pad, y: y, width: W - pad * 2, height: healthRowH))
+            }
+        }
+
         // Footer
         y -= 20
         var stamp = snapshot.fetchedAt == nil ? "not yet updated"
@@ -516,6 +552,110 @@ final class PanelView: NSView {
 
         draw(sub, font: .systemFont(ofSize: 10.5), color: .tertiaryLabelColor,
              in: NSRect(x: rect.minX + gutter, y: rect.maxY - 43,
+                        width: rect.width - gutter, height: 14))
+    }
+
+    // MARK: Mac health rows
+
+    private struct KeyValueRow {
+        var title: String
+        var value: String
+        var sub: String
+        var level: HealthLevel = .ok       // colours the value and lights the dot when not ok
+    }
+
+    private func healthRows(_ h: HealthAssessment) -> [KeyValueRow] {
+        let s = h.sample
+        let st = healthState
+        // Quiet when the machine is fine: per-row colour only once the overall
+        // level (after hysteresis) has moved off ok.
+        func lvl(_ m: HealthMetric) -> HealthLevel { h.level == .ok ? .ok : h.level(for: m) }
+
+        // A reading the sensor could not take is shown as exactly that.
+        var memSub: [String] = []
+        if let k = s.kernelPressure { memSub.append("kernel: \(k)") }   // first: it must never truncate
+        if let swap = s.swap {
+            memSub.append(swap.totalBytes > 0
+                          ? "swap \(Style.gb(swap.usedBytes)) of \(Style.gb(swap.totalBytes)) GB" : "no swap")
+        } else {
+            memSub.append("swap n/a")
+        }
+        if let vm = s.vm { memSub.append("compressed \(Style.bytes(vm.compressedBytes))") }
+        let memory = KeyValueRow(
+            title: "Memory",
+            value: s.memFreePct.map { "\($0)% free" } ?? "unavailable",
+            sub: memSub.joined(separator: " \u{00B7} "),
+            level: lvl(.memory))
+
+        let load: KeyValueRow
+        if let l = s.load, let perCore = s.loadPerCore {
+            load = KeyValueRow(
+                title: "Load",
+                value: String(format: "%.1f per core", perCore),
+                sub: String(format: "1m %.1f \u{00B7} 5m %.1f \u{00B7} 15m %.1f \u{00B7} %d cores",
+                            l.load1, l.load5, l.load15, s.ncpu),
+                level: lvl(.load))
+        } else {
+            load = KeyValueRow(title: "Load", value: "unavailable", sub: "getloadavg failed", level: lvl(.load))
+        }
+
+        let n = s.claude.interactiveSessions.count, m = s.claude.summarizers.count
+        var claudeSub = "\(Style.bytes(s.claude.totalRSS)) resident"
+        if let oldest = s.claude.oldestSession {
+            claudeSub += " \u{00B7} oldest session \(Style.duration(oldest.age))"
+        }
+        let claude = KeyValueRow(
+            title: "Claude",
+            value: "\(n) session\(n == 1 ? "" : "s") \u{00B7} \(m) summarizer\(m == 1 ? "" : "s")",
+            sub: claudeSub,
+            level: lvl(.claude))
+
+        // "Last action" says only what is true: leaks it is not allowed to
+        // touch, an inspection it could not complete, what it terminated in
+        // this session, or a clean check.
+        let checked = "checked \(Style.clock(st.lastCheck ?? s.sampledAt))"
+        let k = st.suspected.count
+        let action: KeyValueRow
+        if k > 0 && !st.autoReap {
+            action = KeyValueRow(title: "Last action", value: "auto-reap off",
+                                 sub: "\(k) suspected leak\(k == 1 ? "" : "s") \u{00B7} \(checked)", level: .warn)
+        } else if s.memFreePct == nil {
+            action = KeyValueRow(title: "Last action", value: "inspection incomplete",
+                                 sub: "memory metric unavailable \u{00B7} \(checked)", level: .warn)
+        } else if let r = st.sessionReap, r.terminated > 0 {
+            action = KeyValueRow(title: "Last action", value: "\(r.terminated) terminated",
+                                 sub: "\(Style.bytes(r.bytesResident)) was resident \u{00B7} \(Style.dayClock(r.at))")
+        } else if k == 0 {
+            action = KeyValueRow(title: "Last action", value: "no leaks found", sub: checked)
+        } else {
+            action = KeyValueRow(title: "Last action", value: "\(k) suspected leak\(k == 1 ? "" : "s")",
+                                 sub: checked)
+        }
+        return [memory, load, claude, action]
+    }
+
+    /// Two-column row without a meter: title left, value right, sub below.
+    /// Same fonts, gutter and dot as `drawMeterRow`; the dot lights only on trouble.
+    private func drawKeyValueRow(_ row: KeyValueRow, in rect: NSRect) {
+        let top = NSRect(x: rect.minX, y: rect.maxY - 17, width: rect.width, height: 15)
+        let gutter: CGFloat = 12
+        let tint: NSColor? = row.level == .ok ? nil : Style.tint(forHealth: row.level)
+        if let tint = tint {
+            let d: CGFloat = 6
+            tint.setFill()
+            NSBezierPath(ovalIn: NSRect(x: rect.minX, y: top.maxY - 8 - d / 2,
+                                        width: d, height: d)).fill()
+        }
+        let titleFont = NSFont.systemFont(ofSize: 12, weight: .medium)
+        let titleW = ceil(NSAttributedString(string: row.title, attributes: [.font: titleFont]).size().width)
+        draw(row.title, font: titleFont, color: .labelColor,
+             in: NSRect(x: rect.minX + gutter, y: top.minY, width: titleW + 2, height: top.height))
+        let valueX = rect.minX + gutter + titleW + 10
+        draw(row.value, font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
+             color: tint ?? .labelColor, align: .right,
+             in: NSRect(x: valueX, y: top.minY, width: rect.maxX - valueX, height: top.height))
+        draw(row.sub, font: .systemFont(ofSize: 10.5), color: .tertiaryLabelColor,
+             in: NSRect(x: rect.minX + gutter, y: rect.maxY - 33,
                         width: rect.width - gutter, height: 14))
     }
 
@@ -579,7 +719,7 @@ enum LoginItem {
 // App
 // ─────────────────────────────────────────────────────────────────────────────
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
 
     private var statusItem: NSStatusItem!
     private let panel = PanelView()
@@ -587,6 +727,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var timer: Timer?
     private var snapshot = Snapshot()
     private var loginToggle: NSMenuItem!
+    private var autoReapToggle: NSMenuItem!
+    private var suspectedItem: NSMenuItem!
+    private var wakeObserver: NSObjectProtocol?
+
+    // Mac health: its own poll timer (health.pollSeconds, default 30 s), the
+    // memory-pressure dispatch source and the reap policy live in the monitor.
+    private let healthMonitor = HealthMonitor()
+    private var healthState = HealthPanelState()
+    private var health: HealthAssessment? { healthState.assessment }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -596,6 +745,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildMenu()
         statusItem.menu = menu
 
+        // Health first: it must never wait behind a slow Keychain call.
+        healthMonitor.onUpdate = { [weak self] state in
+            guard let self = self else { return }
+            self.healthState = state
+            self.panel.healthState = state
+            self.panel.frame = NSRect(origin: .zero, size: self.panel.intrinsicContentSize)
+            self.render()
+        }
+        healthMonitor.start()
+
         refresh()
         // 5 min: the endpoint's limiter is shared with Claude Code's own calls,
         // and a 2-minute cadence was measured to keep it armed once tripped.
@@ -604,9 +763,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         timer?.tolerance = 10
 
-        NSWorkspace.shared.notificationCenter.addObserver(
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.refresh() }
+        ) { [weak self] _ in self?.refresh(); self?.healthMonitor.poll() }
+    }
+
+    func applicationWillTerminate(_ note: Notification) {
+        if let token = wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(token) }
+        wakeObserver = nil
+        healthMonitor.stop()
     }
 
     private func buildMenu() {
@@ -624,6 +789,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshItem.target = self
         menu.addItem(refreshItem)
 
+        let reapItem = NSMenuItem(title: "Reap Leaks Now", action: #selector(reapNow), keyEquivalent: "k")
+        reapItem.target = self
+        menu.addItem(reapItem)
+
+        autoReapToggle = NSMenuItem(title: "Auto-reap Leaks", action: #selector(toggleAutoReap),
+                                    keyEquivalent: "")
+        autoReapToggle.target = self
+        menu.addItem(autoReapToggle)
+
+        suspectedItem = NSMenuItem(title: "Suspected Leaks\u{2026}", action: #selector(showSuspected),
+                                   keyEquivalent: "")
+        suspectedItem.target = self
+        menu.addItem(suspectedItem)
+
+        let monitorItem = NSMenuItem(title: "Open Activity Monitor", action: #selector(openActivityMonitor),
+                                     keyEquivalent: "")
+        monitorItem.target = self
+        menu.addItem(monitorItem)
+
         loginToggle = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin),
                                  keyEquivalent: "")
         loginToggle.target = self
@@ -637,14 +821,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         loginToggle.state = LoginItem.isEnabled ? .on : .off
+        autoReapToggle.state = HealthPrefs.autoReap ? .on : .off
         panel.frame = NSRect(origin: .zero, size: panel.intrinsicContentSize)
         panel.needsDisplay = true
         refresh()
+        healthMonitor.poll()
+    }
+
+    /// "Suspected Leaks…" is live only while there is something to show.
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        item.action == #selector(showSuspected) ? !healthState.suspected.isEmpty : true
     }
 
     private var lastFetchStarted = Date.distantPast
 
     @objc private func refreshNow() { refresh(force: true) }
+
+    @objc private func reapNow() { healthMonitor.poll(manual: true) }
+
+    /// Lists the current targets and offers to terminate them (a manual reap,
+    /// which runs whether or not auto-reap is on).
+    @objc private func showSuspected() {
+        let list = healthState.suspected
+        guard !list.isEmpty else { return }
+        let alert = NSAlert()
+        alert.messageText = "\(list.count) suspected leak\(list.count == 1 ? "" : "s")"
+        alert.informativeText = list.map { p in
+            let kind = p.owner != nil ? "summarizer" : "headless Chrome"
+            var line = "pid \(p.pid) \u{00B7} \(kind) \u{00B7} \(Style.duration(p.age)) \u{00B7} \(Style.bytes(p.rss))"
+            if let owner = p.owner, let op = p.ownerPid { line += " \u{00B7} \(owner) (pid \(op))" }
+            return line
+        }.joined(separator: "\n")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Terminate")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            healthMonitor.poll(manual: true)
+        }
+    }
+
+    @objc private func toggleAutoReap() {
+        HealthPrefs.autoReap.toggle()
+        autoReapToggle.state = HealthPrefs.autoReap ? .on : .off
+    }
+
+    @objc private func openActivityMonitor() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app"))
+    }
 
     @objc private func toggleLogin() {
         LoginItem.setEnabled(!LoginItem.isEnabled)
@@ -698,13 +922,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             color = .tertiaryLabelColor
         }
 
-        button.attributedTitle = NSAttributedString(string: text, attributes: [
+        let title = NSMutableAttributedString(string: text, attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium),
             .foregroundColor: color,
         ])
-        button.toolTip = snapshot.error
-            ?? "Claude usage remaining \u{2014} session \u{00B7} week"
+        var tip = snapshot.error ?? "Claude usage remaining \u{2014} session \u{00B7} week"
+        // Mac health: a coloured dot in front of the text, only when not ok.
+        if let h = health, h.level != .ok {
+            title.insert(healthDot(h.level), at: 0)
+            if let top = h.reasons.first { tip += "\nMac: \(top)" }
+        }
+        button.attributedTitle = title
+        button.toolTip = tip
     }
+}
+
+/// "● " tinted yellow or red; `text` already starts with a space.
+func healthDot(_ level: HealthLevel) -> NSAttributedString {
+    NSAttributedString(string: "\u{25CF}", attributes: [
+        .font: NSFont.systemFont(ofSize: 9, weight: .bold),
+        .foregroundColor: Style.tint(forHealth: level),
+        .baselineOffset: 1,
+    ])
 }
 
 /// Renders `body` into a PNG at `scale`x under an explicit appearance. Shared by
@@ -727,6 +966,44 @@ func renderPNG(to out: URL, size: NSSize, scale: CGFloat, dark: Bool,
     try? rep.representation(using: .png, properties: [:])?.write(to: out)
 }
 
+// Debug: the KERN_PROCARGS2 parser and fingerprint scanners against fixtures.
+if CommandLine.arguments.contains("--argv-selftest") {
+    exit(HealthDebug.argvSelfTest() == 0 ? 0 : 1)
+}
+
+// Debug: one Mac health sample + assessment as JSON, timing on stderr, exit.
+// Assessed twice, the first copy backdated past the promotion age, so the
+// printed level is the steady state rather than the hysteresis floor.
+if CommandLine.arguments.contains("--health-json") {
+    let sample = HealthSensor.sample()
+    var earlier = sample
+    earlier.sampledAt = sample.sampledAt.addingTimeInterval(-HealthScorer.promotionAge)
+    _ = HealthScorer.assess(earlier)
+    let assessment = HealthScorer.assess(sample)
+    print(HealthDebug.json(assessment))
+    FileHandle.standardError.write(String(format: "sample took %.1f ms\n", sample.sampleMillis).data(using: .utf8)!)
+    exit(0)
+}
+
+// Debug: list what a reap would kill right now, and exit without killing.
+if CommandLine.arguments.contains("--reap-dry-run") {
+    let sample = HealthSensor.sample()
+    print(HealthDebug.dryRun(sample))
+    FileHandle.standardError.write(String(format: "sample took %.1f ms\n", sample.sampleMillis).data(using: .utf8)!)
+    exit(0)
+}
+
+// Debug: post one test notification through the same path the reaper uses.
+if CommandLine.arguments.contains("--notify-test") {
+    NSApplication.shared.setActivationPolicy(.prohibited)
+    HealthNotifier.requestAuthorization()
+    HealthNotifier.post(title: "Claude Usage reaped leaks", body: "37 summarizers terminated \u{00B7} 2.1 GB was resident (test)") {
+        print($0)
+    }
+    RunLoop.main.run(until: Date().addingTimeInterval(3))
+    exit(0)
+}
+
 // Debug: render the menu bar item to a PNG and exit.
 if let i = CommandLine.arguments.firstIndex(of: "--icon"),
    CommandLine.arguments.count > i + 1 {
@@ -742,10 +1019,16 @@ if let i = CommandLine.arguments.firstIndex(of: "--icon"),
         icon.draw(at: NSPoint(x: x, y: (rect.height - icon.size.height) / 2),
                   from: .zero, operation: .sourceOver, fraction: 1)
         let label = String(format: " %.0f%% \u{00B7} %.0f%%", 100 - sessionUsed, 100 - weekUsed)
-        NSAttributedString(string: label, attributes: [
+        let title = NSMutableAttributedString(string: label, attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium),
             .foregroundColor: NSColor.labelColor,
-        ]).draw(at: NSPoint(x: x + icon.size.width, y: (rect.height - 14) / 2))
+        ])
+        // `--health warn|critical` previews the Mac health dot.
+        if let h = CommandLine.arguments.firstIndex(of: "--health"), CommandLine.arguments.count > h + 1 {
+            let level: HealthLevel = CommandLine.arguments[h + 1] == "critical" ? .critical : .warn
+            title.insert(healthDot(level), at: 0)
+        }
+        title.draw(at: NSPoint(x: x + icon.size.width, y: (rect.height - 14) / 2))
     }
     print("wrote \(out.path)")
     exit(0)
@@ -785,6 +1068,45 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
     let view = PanelView()
     view.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
     view.snapshot = snap
+    if CommandLine.arguments.contains("--demo") {
+        // A Mac under pressure, so the section shows its colour in the shot.
+        let now = Date()
+        func proc(_ pid: pid_t, age: TimeInterval, mb: UInt64, _ args: [String]) -> ProcInfo {
+            let start = now.addingTimeInterval(-age)
+            return ProcInfo(pid: pid, ppid: 1, rss: mb << 20,
+                            startSec: Int64(start.timeIntervalSince1970), startUsec: 0, started: start,
+                            path: "/Users/me/.local/share/claude/versions/2.1.277", args: args)
+        }
+        var stack = ClaudeStack()
+        stack.interactiveSessions = (0..<5).map { proc(2000 + pid_t($0), age: 3.05 * 86400 - Double($0) * 40000, mb: 300, ["claude"]) }
+        stack.summarizers = (0..<37).map { proc(9000 + pid_t($0), age: 3 * 3600, mb: 58, ["claude", "--output-format", "stream-json"]) }
+        stack.totalRSS = (stack.interactiveSessions + stack.summarizers).reduce(0) { $0 + $1.rss }
+        let sample = HealthSample(
+            memFreePct: 11, memSource: "kern.memorystatus_level",
+            vm: VMStats(freeBytes: 380 << 20, compressedBytes: 3_300 << 20, wiredBytes: 3_600 << 20, inactiveBytes: 900 << 20),
+            swap: SwapStats(usedBytes: 4_500 << 20, totalBytes: 9_200 << 20),
+            load: LoadStats(load1: 62.9, load5: 32.8, load15: 4.5), ncpu: 14,
+            kernelPressure: "critical", sampledAt: now, claude: stack, sampleMillis: 12,
+            validity: Validity(memory: true, vm: true, swap: true, load: true))
+        var earlier = sample
+        earlier.sampledAt = now.addingTimeInterval(-HealthScorer.promotionAge)
+        _ = HealthScorer.assess(earlier)
+        var reap = ReapResult()
+        reap.summarizersKilled = 37; reap.signalled = 37; reap.bytesResident = 2_150 << 20
+        reap.at = now.addingTimeInterval(-8 * 60)
+        view.healthState = HealthPanelState(assessment: HealthScorer.assess(sample), suspected: [],
+                                            autoReap: true, sessionReap: reap, lastCheck: now)
+    } else {
+        let sample = HealthSensor.sample()
+        var earlier = sample
+        earlier.sampledAt = sample.sampledAt.addingTimeInterval(-HealthScorer.promotionAge)
+        _ = HealthScorer.assess(earlier)
+        let assessment = HealthScorer.assess(sample)
+        view.healthState = HealthPanelState(
+            assessment: assessment,
+            suspected: HealthAction.targets(in: sample, emergency: assessment.emergency).all,
+            autoReap: HealthPrefs.autoReap, sessionReap: nil, lastCheck: sample.sampledAt)
+    }
     view.frame = NSRect(origin: .zero, size: view.intrinsicContentSize)
     renderPNG(to: out, size: view.bounds.size, scale: 2, dark: dark) { rect in
         (dark ? NSColor(white: 0.13, alpha: 1) : NSColor(white: 0.97, alpha: 1)).setFill()
