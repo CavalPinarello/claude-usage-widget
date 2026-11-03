@@ -4,7 +4,7 @@ import Cocoa
 // Model
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct Gauge {
+struct Gauge: Codable {
     var key: String          // "session" | "weekly" | scoped key
     var label: String        // "Session (5h)"
     var percentUsed: Double  // 0...100
@@ -13,7 +13,7 @@ struct Gauge {
     var percentLeft: Double { max(0, 100 - percentUsed) }
 }
 
-struct ExtraCredits {
+struct ExtraCredits: Codable {
     var enabled: Bool
     var percentUsed: Double
     var usedMinor: Double
@@ -32,6 +32,45 @@ struct Snapshot {
 
     var session: Gauge? { gauges.first { $0.key == "session" } }
     var weekly: Gauge? { gauges.first { $0.key == "weekly" } }
+}
+
+/// Last good reading, kept across launches so a rate-limited start still has
+/// something to show.
+enum ReadingCache {
+    private struct Stored: Codable {
+        var gauges: [Gauge]
+        var extra: ExtraCredits?
+        var plan: String
+        var fetchedAt: Date
+    }
+
+    private static let key = "lastReading"
+
+    static func save(_ s: Snapshot) {
+        guard s.error == nil, !s.gauges.isEmpty, let at = s.fetchedAt,
+              let data = try? JSONEncoder().encode(
+                  Stored(gauges: s.gauges, extra: s.extra, plan: s.plan, fetchedAt: at))
+        else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+
+    static func load() -> Snapshot? {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let stored = try? JSONDecoder().decode(Stored.self, from: data)
+        else { return nil }
+        // A window that has reset since the reading no longer reflects reality,
+        // and its current value is unknown, so leave it out rather than guess.
+        let now = Date()
+        let gauges = stored.gauges.filter { ($0.resetsAt ?? .distantFuture) > now }
+        guard !gauges.isEmpty else { return nil }
+        var s = Snapshot()
+        s.gauges = gauges
+        s.extra = stored.extra
+        s.plan = stored.plan
+        s.fetchedAt = stored.fetchedAt
+        s.stale = true
+        return s
+    }
 }
 
 enum UsageError: LocalizedError {
@@ -67,6 +106,28 @@ enum UsageFetcher {
         set { holdLock.lock(); _holdUntil = newValue; holdLock.unlock() }
     }
 
+    /// Consecutive 429s since the last success; drives the backoff length.
+    private static var _strikes = 0
+
+    /// Records a 429 and returns how long to stay off the endpoint:
+    /// 60s, 120s, 240s, ... capped at 15 minutes.
+    private static func registerRateLimit() -> TimeInterval {
+        holdLock.lock(); defer { holdLock.unlock() }
+        let delay = min(60 * pow(2, Double(_strikes)), 900)
+        _strikes += 1
+        return delay
+    }
+
+    private static func resetRateLimit() {
+        holdLock.lock(); _strikes = 0; holdLock.unlock()
+    }
+
+    private static func retryPhrase(_ secs: TimeInterval) -> String {
+        let s = Int(secs.rounded())
+        if s <= 5 { return "shortly" }
+        return s < 90 ? "in \(s)s" : "in \(Int((Double(s) / 60).rounded()))m"
+    }
+
     /// Reads the OAuth blob Claude Code stores in the login Keychain.
     /// Shells out to /usr/bin/security on purpose: that binary already holds the
     /// ACL grant, so this never triggers a "wants to access" prompt of its own.
@@ -100,7 +161,7 @@ enum UsageFetcher {
         let hold = holdUntil
         if hold > Date() {
             var s = Snapshot()
-            s.error = "Rate limited \u{2013} retrying in \(Int(hold.timeIntervalSinceNow.rounded()))s"
+            s.error = "Rate limited \u{2013} retrying \(retryPhrase(hold.timeIntervalSinceNow))"
             return completion(s)
         }
 
@@ -133,11 +194,15 @@ enum UsageFetcher {
             let http = response as? HTTPURLResponse
             let code = http?.statusCode ?? 0
             if code == 429 {
-                let secs = Double(http?.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 65
-                holdUntil = Date().addingTimeInterval(secs + 3)
-                s.error = "Rate limited \u{2013} retrying in \(Int(secs))s"
+                // The endpoint answers `Retry-After: 0` while it keeps refusing,
+                // so the header is only a floor; back off exponentially on top.
+                let hinted = Double(http?.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 0
+                let secs = max(hinted, registerRateLimit())
+                holdUntil = Date().addingTimeInterval(secs)
+                s.error = "Rate limited \u{2013} retrying \(retryPhrase(secs))"
                 return completion(s)
             }
+            if (200..<300).contains(code) { resetRateLimit() }
             guard (200..<300).contains(code) else {
                 s.error = UsageError.http(code).errorDescription
                 return completion(s)
@@ -287,7 +352,8 @@ enum Style {
     static func clock(_ date: Date?) -> String {
         guard let date = date else { return "never" }
         let f = DateFormatter()
-        f.setLocalizedDateFormatFromTemplate("jmm")
+        // A cached reading can be from another day; the time alone would mislead.
+        f.setLocalizedDateFormatFromTemplate(Calendar.current.isDateInToday(date) ? "jmm" : "MMMdjmm")
         return f.string(from: date)
     }
 }
@@ -535,6 +601,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ note: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.imagePosition = .imageLeading
+        if let cached = ReadingCache.load() {
+            snapshot = cached
+            panel.snapshot = cached
+        }
         render()
 
         buildMenu()
@@ -611,6 +681,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     snap.fetchedAt = self.snapshot.fetchedAt
                     snap.stale = true
                 }
+                ReadingCache.save(snap)
                 self.snapshot = snap
                 self.panel.snapshot = snap
                 self.panel.frame = NSRect(origin: .zero, size: self.panel.intrinsicContentSize)

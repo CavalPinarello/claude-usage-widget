@@ -9,8 +9,14 @@ MACOS="$APP/Contents/MacOS"
 RES="$APP/Contents/Resources"
 
 echo "→ stopping any running copy"
-pkill -f "Claude Usage.app/Contents/MacOS/ClaudeUsage" 2>/dev/null || true
-sleep 0.4
+# Stop by PID, matched on the exact executable name: `pkill -f` matches any
+# process whose arguments merely contain the string.
+for PID in $(pgrep -x ClaudeUsage); do
+  case "$(ps -o command= -p "$PID")" in
+    *"Claude Usage.app/Contents/MacOS/ClaudeUsage"*) kill "$PID" ;;
+  esac
+done
+for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -qx ClaudeUsage || break; sleep 0.3; done
 
 if ! xcode-select -p >/dev/null 2>&1; then
   echo "Xcode command line tools are required:  xcode-select --install" >&2
