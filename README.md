@@ -69,17 +69,26 @@ Worth knowing before you run something that touches your Keychain:
 - The token goes to `api.anthropic.com` and nowhere else. There is no telemetry,
   no analytics, no config file, no network call other than the one above.
 
-It is a single ~660-line Swift file. Read it.
+It is a single ~800-line Swift file. Read it.
 
 ## Rate limiting
 
-The usage endpoint sits behind a tight sliding-window limiter. It answers 429
-with `Retry-After: 65`, and — the part that bites — **a request made during the
-hold re-arms the window**, so a naive 30-second poll can stay 429'd indefinitely.
+The usage endpoint sits behind a tight sliding-window limiter, and — the part
+that bites — **a request made during the hold re-arms the window**, so a naive
+30-second poll can stay 429'd indefinitely. The 429's `Retry-After` header is not
+a reliable guide: it has been seen as `65`, and also as `0` on a 429 that kept
+repeating for minutes.
 
-The widget parses `Retry-After` and makes no network call at all until the hold
-expires. Base interval is 90 seconds, plus a refresh on menu open (throttled to
-one per 30s) and on wake from sleep. If you fork this, keep that behaviour.
+The widget therefore treats `Retry-After` as a floor and backs off exponentially
+on consecutive 429s (60s, 120s, 240s, … capped at 15 minutes), making no network
+call at all until the hold expires. A successful read resets the backoff. Base
+interval is 90 seconds, plus a refresh on menu open (throttled to one per 30s)
+and on wake from sleep. If you fork this, keep that behaviour.
+
+The last good reading is saved in the app's user defaults, so a launch that lands
+inside a rate-limit window still shows numbers, marked as last known good.
+Limits whose window has reset since that reading are dropped rather than shown
+with stale values.
 
 ## Terminal companion
 
