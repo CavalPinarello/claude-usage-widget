@@ -2,6 +2,7 @@
 # Prints Claude usage in the terminal. Same source the menu bar widget uses.
 # Flags: --json (raw API response)  --bar (one-line, statusline friendly)
 set -euo pipefail
+HERE="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"  # survives a symlink onto PATH
 
 CREDS=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || {
   echo "No Claude Code login in Keychain." >&2; exit 1; }
@@ -45,21 +46,25 @@ def when(s):
     return f"resets in {rel} ({t.astimezone().strftime('%a %H:%M')})"
 
 rows = []
-for l in d.get("limits", []):
+shares = {s.get("limit_index"): s.get("allowance_percent_of_weekly")
+          for s in d.get("weekly_scoped_shares") or []}
+for i, l in enumerate(d.get("limits", [])):
     k = l.get("kind")
     if k == "session":       name = "Session (5h)"
     elif k == "weekly_all":  name = "Week (all)"
     elif k == "weekly_scoped":
         sc = (l.get("scope") or {}).get("model") or {}
-        if not l.get("percent"): continue
         name = "Week (%s)" % (sc.get("display_name") or "scoped")
     else: continue
-    rows.append((name, float(l.get("percent") or 0), when(l.get("resets_at")), l.get("is_active")))
+    reset = when(l.get("resets_at"))
+    if shares.get(i) is not None: reset = "up to %d%% of week, %s" % (shares[i], reset)
+    rows.append((name, float(l.get("percent") or 0), reset, l.get("is_active")))
 
 if mode == "--bar":
     s = next((r for r in rows if r[0].startswith("Session")), None)
     w = next((r for r in rows if r[0].startswith("Week (all)")), None)
-    print("session %d%% | week %d%% left" % (100-(s[1] if s else 0), 100-(w[1] if w else 0)))
+    week = "week %d%% left" % (100-(w[1] if w else 0))
+    print("session %d%% | %s" % (100-s[1], week) if s else week)
     sys.exit()
 
 W = 24
@@ -70,9 +75,25 @@ for name, pct, reset, active in rows:
     col = "\033[32m" if pct < 60 else ("\033[33m" if pct < 80 else "\033[31m")
     bar = col + "#"*fill + "\033[0m" + "."*(W-fill)
     print(f"  {dot}{name:<16} [{bar}] {100-pct:>3.0f}% left   {reset}")
+products = [r for r in (d.get("seven_day_breakdown") or {}).get("rows", []) if r.get("percent")]
+if products:
+    print("    This week: " + ", ".join("%s %d%%" % (r["display_name"], r["percent"]) for r in products))
 sp = d.get("spend") or {}
 if sp.get("enabled"):
     print("    %-16s $%.2f of $%.0f used" % ("Extra credits",
           sp["used"]["amount_minor"]/100, sp["limit"]["amount_minor"]/100))
 print()
 PY
+
+[ "${1:-}" = "--bar" ] && exit 0
+
+# The week starts seven days before it resets.
+SINCE=$(python3 - "$RESP" <<'PY'
+import datetime, json, sys
+for l in json.loads(sys.argv[1]).get("limits", []):
+    if l.get("kind") == "weekly_all" and l.get("resets_at"):
+        t = datetime.datetime.fromisoformat(l["resets_at"].replace("Z", "+00:00"))
+        print((t - datetime.timedelta(days=7)).isoformat())
+PY
+)
+"$HERE/claude-usage-models" ${SINCE:+--since "$SINCE"}

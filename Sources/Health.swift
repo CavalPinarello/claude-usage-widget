@@ -68,10 +68,14 @@ struct ClaudeStack: Encodable {
 struct VMStats: Encodable { var freeBytes: UInt64; var compressedBytes: UInt64; var wiredBytes: UInt64; var inactiveBytes: UInt64 }
 struct SwapStats: Encodable { var usedBytes: UInt64; var totalBytes: UInt64 }
 struct LoadStats: Encodable { var load1: Double; var load5: Double; var load15: Double }
+/// The data volume, as `df` reports it (f_bavail: what a normal process can
+/// still write, purgeable space not counted). Swap files live on the same
+/// container, so this is also the room swap has left to grow.
+struct DiskStats: Encodable { var freeBytes: UInt64; var totalBytes: UInt64 }
 
 /// Which readings are real. A sensor that failed is nil in the sample and
 /// false here; nothing downstream may treat a missing reading as a number.
-struct Validity: Encodable { var memory: Bool; var vm: Bool; var swap: Bool; var load: Bool }
+struct Validity: Encodable { var memory: Bool; var vm: Bool; var swap: Bool; var load: Bool; var disk: Bool = false }
 
 struct HealthSample: Encodable {
     var memFreePct: Int?         // kern.memorystatus_level (what `memory_pressure` prints), or a vm_stat fallback
@@ -85,6 +89,7 @@ struct HealthSample: Encodable {
     var claude: ClaudeStack
     var sampleMillis: Double     // how long the sample took
     var validity: Validity
+    var disk: DiskStats? = nil
 
     var loadPerCore: Double? {
         guard let l = load else { return nil }
@@ -160,6 +165,7 @@ enum HealthSensor {
             memFreePct = nil; memSource = "unavailable"
         }
 
+        let disk = diskStats()
         let stack = claudeStack()
         let ms = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e6
 
@@ -168,7 +174,21 @@ enum HealthSensor {
             vm: vm, swap: swap, load: load, ncpu: ncpu,
             kernelPressure: kernelPressure,
             sampledAt: Date(), claude: stack, sampleMillis: ms,
-            validity: Validity(memory: memFreePct != nil, vm: vm != nil, swap: swap != nil, load: load != nil))
+            validity: Validity(memory: memFreePct != nil, vm: vm != nil, swap: swap != nil,
+                               load: load != nil, disk: disk != nil),
+            disk: disk)
+    }
+
+    /// statfs on the data volume (where $HOME and the swap files live); "/" is
+    /// the sealed system snapshot on modern macOS and always looks full.
+    static func diskStats() -> DiskStats? {
+        for path in ["/System/Volumes/Data", "/"] {
+            var st = statfs()
+            guard statfs(path, &st) == 0, st.f_blocks > 0 else { continue }
+            let bs = UInt64(st.f_bsize)
+            return DiskStats(freeBytes: UInt64(st.f_bavail) * bs, totalBytes: UInt64(st.f_blocks) * bs)
+        }
+        return nil
     }
 
     private static func sysctlInt32(_ name: String) -> Int32? {
@@ -559,6 +579,7 @@ enum HealthPrefs {
     static let chromeMaxAgeKey = "health.chromeMaxAgeMin"
     static let emergencyAgeKey = "health.emergencySummarizerAgeMin"
     static let pollSecondsKey = "health.pollSeconds"
+    static let burstMaxKey = "health.summarizerBurstMax"
     static let lastReapKey = "health.lastReapJSON"
 
     private static let registered: Void = {
@@ -568,6 +589,7 @@ enum HealthPrefs {
             emergencyAgeKey: 10,
             chromeMaxAgeKey: 60,
             pollSecondsKey: 30,
+            burstMaxKey: 10,
         ])
     }()
     private static var defaults: UserDefaults { _ = registered; return .standard }
@@ -588,6 +610,12 @@ enum HealthPrefs {
     static var emergencySummarizerAge: TimeInterval {
         Double(max(1, defaults.integer(forKey: emergencyAgeKey))) * 60
     }
+    /// Burst rule (2026-11-09): more summarizers than this at once and the
+    /// extras are reaped whatever their age. After a reboot the worker started
+    /// 25 in one minute (about 12 GB) and none was old enough for the age rule.
+    /// 0 turns the rule off.
+    static var summarizerBurstMax: Int { max(0, defaults.integer(forKey: burstMaxKey)) }
+
     static var pollSeconds: TimeInterval {
         Double(max(10, defaults.integer(forKey: pollSecondsKey)))
     }
@@ -621,7 +649,7 @@ enum HealthLevel: Int, Comparable, Encodable {
     }
 }
 
-enum HealthMetric: String, Encodable { case memory, load, claude }
+enum HealthMetric: String, Encodable { case memory, load, claude, disk }
 
 struct HealthReason: Encodable {
     let metric: HealthMetric
@@ -654,6 +682,10 @@ enum HealthScorer {
     static let staleCritical = 20
     static let stackWarnBytes: UInt64 = 4 << 30
     static let swapCriticalBytes: UInt64 = 6 << 30
+    // 2026-11-07: the disk sat at 99% (8.5 GB free) with swap at 12 GB and
+    // nothing flagged it. Below ~20 GB swap cannot grow and the Mac thrashes.
+    static let diskWarnBytes: UInt64 = 50 << 30
+    static let diskCriticalBytes: UInt64 = 20 << 30
     static let historyLength = 6
     static let promotionAge: TimeInterval = 20    // the confirming sample must be this old
 
@@ -690,6 +722,15 @@ enum HealthScorer {
             }
         } else {
             add(.load, .warn, "load metric unavailable")
+        }
+
+        // An unreadable disk says nothing either way, so it stays silent.
+        if let d = s.disk {
+            if d.freeBytes < diskCriticalBytes {
+                add(.disk, .critical, "disk \(Style.bytes(d.freeBytes)) free")
+            } else if d.freeBytes < diskWarnBytes {
+                add(.disk, .warn, "disk \(Style.bytes(d.freeBytes)) free")
+            }
         }
 
         // The leak's signature is accumulation: a healthy worker holds about one
@@ -729,11 +770,12 @@ enum HealthScorer {
     /// have piled up. No hysteresis: an emergency reap must not wait a poll.
     /// A metric that could not be read never contributes (`evaluate` emits no
     /// critical reason from it), and a kernel `.critical` pressure event is an
-    /// emergency whatever the polled percentage says.
+    /// emergency whatever the polled percentage says. A full disk colours the
+    /// menu bar but is no emergency: killing summarizers frees no disk space.
     static func isEmergency(_ s: HealthSample, kernelCritical: Bool = false) -> Bool {
         if kernelCritical { return true }
         let (_, reasons) = evaluate(s)
-        return reasons.contains { $0.level == .critical }
+        return reasons.contains { $0.level == .critical && $0.metric != .disk }
     }
 
     /// A level is promoted only when the previous sample was already at that
@@ -807,11 +849,22 @@ enum HealthAction {
 
     /// What `reap` would kill: only fingerprinted processes past their age
     /// limit. Interactive sessions never appear here by construction.
-    static func targets(in s: HealthSample, emergency: Bool = false) -> Targets {
+    /// `summarizerAge` overrides the age limit; only Free Up Memory passes it
+    /// (0 while memory is low: the click is the consent, see Relief.swift).
+    static func targets(in s: HealthSample, emergency: Bool = false,
+                        summarizerAge: TimeInterval? = nil) -> Targets {
         var t = Targets()
-        let sAge = emergency ? HealthPrefs.emergencySummarizerAge : HealthPrefs.summarizerMaxAge
+        let sAge = summarizerAge ?? (emergency ? HealthPrefs.emergencySummarizerAge : HealthPrefs.summarizerMaxAge)
         let cAge = HealthPrefs.chromeMaxAge
         t.summarizers = s.claude.summarizers.filter { $0.age > sAge }
+        // Burst rule: keep the newest `burstMax` (most likely still tied to a
+        // live session), reap every older one beyond that, whatever its age.
+        let burstMax = HealthPrefs.summarizerBurstMax
+        if burstMax > 0, s.claude.summarizers.count > burstMax {
+            let chosen = Set(t.summarizers.map(\.pid))
+            let extras = s.claude.summarizers.sorted { $0.started > $1.started }.dropFirst(burstMax)
+            t.summarizers += extras.filter { !chosen.contains($0.pid) }
+        }
         t.chrome = s.claude.headlessChrome.filter { $0.age > cAge }
         let mains = Set(t.chrome.map(\.pid))
         t.chromeChildren = s.claude.chromeChildren.filter { mains.contains($0.ppid) }
@@ -827,10 +880,10 @@ enum HealthAction {
     /// on the process as it is at that moment: same identity, current path and
     /// argv still match the exact fingerprint, never us, our parent, or the
     /// worker. Counts are outcomes: only a process confirmed gone is "killed".
-    static func reap(sample: HealthSample, emergency: Bool = false,
+    static func reap(sample: HealthSample, emergency: Bool = false, summarizerAge: TimeInterval? = nil,
                      on queue: DispatchQueue, completion: @escaping (ReapResult) -> Void) {
         var result = ReapResult()
-        let t = targets(in: sample, emergency: emergency)
+        let t = targets(in: sample, emergency: emergency, summarizerAge: summarizerAge)
         guard !t.isEmpty else { return completion(result) }
 
         var termed: [Termed] = []
@@ -1110,7 +1163,7 @@ final class HealthMonitor {
             sessionReap = result
             if result.killedAnything {
                 HealthPrefs.lastReap = result
-                HealthNotifier.post(title: "Claude Usage reaped leaks", body: result.summary)
+                HealthNotifier.post(title: "Headroom reaped leaks", body: result.summary)
                 sample = HealthSensor.sample(kernelPressure: r.kernelEvent)   // show the post-reap state
             }
         }
@@ -1308,6 +1361,33 @@ enum HealthDebug {
                       !HealthSensor.isClaudeBinary(path: HealthSensor.claudeVersionsDir + "2.1.277", args: ["ugrep", "-G"])))
         cases.append(("claude binary: other path + argv0 claude is not",
                       !HealthSensor.isClaudeBinary(path: "/usr/local/bin/claude", args: ["claude"])))
+
+        // Burst rule: 25 summarizers 1-25 min old (the 2026-11-09 boot burst).
+        do {
+            let now = Date()
+            func summ(_ i: Int) -> ProcInfo {
+                let start = now.addingTimeInterval(-Double(i) * 60)
+                return ProcInfo(pid: pid_t(50_000 + i), ppid: 5702, rss: 400 << 20,
+                                startSec: Int64(start.timeIntervalSince1970), startUsec: 0, started: start,
+                                path: "/x/claude", args: ["claude"], ownerPid: 5702, owner: "claude-mem worker")
+            }
+            var stack = ClaudeStack()
+            stack.summarizers = (1...25).map(summ)
+            let sample = HealthSample(memFreePct: 60, memSource: "test", vm: nil, swap: nil, load: nil, ncpu: 14,
+                                      kernelPressure: nil, sampledAt: now, claude: stack, sampleMillis: 0,
+                                      validity: Validity(memory: true, vm: false, swap: false, load: false))
+            let max = HealthPrefs.summarizerBurstMax
+            let t = HealthAction.targets(in: sample)
+            let reaped = Set(t.summarizers.map(\.pid))
+            let wantReaped = Set((max + 1...25).map { pid_t(50_000 + $0) })   // the oldest beyond the newest `max`
+            cases.append(("burst rule: 25 young summarizers, newest \(max) kept, \(25 - max) reaped",
+                          max > 0 && reaped == wantReaped))
+            stack.summarizers = (1...max).map(summ)
+            let quiet = HealthSample(memFreePct: 60, memSource: "test", vm: nil, swap: nil, load: nil, ncpu: 14,
+                                     kernelPressure: nil, sampledAt: now, claude: stack, sampleMillis: 0,
+                                     validity: Validity(memory: true, vm: false, swap: false, load: false))
+            cases.append(("burst rule: \(max) young summarizers, none reaped", HealthAction.targets(in: quiet).summarizers.isEmpty))
+        }
 
         var failures = 0
         for (name, ok) in cases {

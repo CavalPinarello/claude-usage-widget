@@ -10,7 +10,27 @@ struct Gauge {
     var percentUsed: Double  // 0...100
     var resetsAt: Date?
     var isActive: Bool
+    var note: String? = nil  // shown before the reset countdown
     var percentLeft: Double { max(0, 100 - percentUsed) }
+}
+
+/// One product's part of this week's usage, as reported by the usage API.
+struct ProductShare {
+    var name: String
+    var percent: Double
+}
+
+/// One model's estimated part of this week's Claude Code usage.
+struct ModelShare {
+    var name: String
+    var share: Double
+}
+
+/// Output of bin/claude-usage-models, which works this out from local logs.
+struct ModelEstimate {
+    var models: [ModelShare] = []
+    var hosts: [String] = []
+    var unreachable: [String] = []
 }
 
 struct ExtraCredits {
@@ -24,6 +44,7 @@ struct ExtraCredits {
 
 struct Snapshot {
     var gauges: [Gauge] = []
+    var products: [ProductShare] = []
     var extra: ExtraCredits?
     var plan: String = ""
     var fetchedAt: Date?
@@ -199,6 +220,7 @@ enum UsageFetcher {
             else { s.error = UsageError.badPayload.errorDescription; return completion(s) }
 
             s.gauges = parseGauges(json)
+            s.products = parseProducts(json)
             s.extra = parseExtra(json)
             s.fetchedAt = Date()
             log("200 after \(strikes) strike(s)")
@@ -209,13 +231,9 @@ enum UsageFetcher {
     }
 
     private static func prettyPlan(plan: String, tier: String) -> String {
-        // e.g. plan "max" + tier "default_claude_max_5x" -> "Max 5x"
-        var name = plan.isEmpty ? "" : plan.prefix(1).uppercased() + plan.dropFirst()
-        if let r = tier.range(of: "max_", options: .backwards) {
-            let mult = tier[r.upperBound...]   // "5x" / "20x"
-            if !mult.isEmpty { name += " " + mult }
-        }
-        return name
+        // Max 20x is now sold as Ultra and Max 5x as Max, but tokens keep the old tier id.
+        if tier.hasSuffix("max_20x") { return "Ultra" }
+        return plan.isEmpty ? "" : plan.prefix(1).uppercased() + plan.dropFirst()
     }
 
     /// Prefers the newer `limits[]` array; falls back to the flat five_hour /
@@ -224,7 +242,14 @@ enum UsageFetcher {
         var out: [Gauge] = []
 
         if let limits = json["limits"] as? [[String: Any]] {
-            for l in limits {
+            // Fable's cap comes as a share of the week, in a list indexed by limit.
+            var allowance: [Int: Double] = [:]
+            for share in (json["weekly_scoped_shares"] as? [[String: Any]]) ?? [] {
+                if let i = share["limit_index"] as? Int,
+                   let a = share["allowance_percent_of_weekly"] as? Double { allowance[i] = a }
+            }
+
+            for (index, l) in limits.enumerated() {
                 let kind = (l["kind"] as? String) ?? ""
                 let pct = (l["percent"] as? Double) ?? 0
                 let active = (l["is_active"] as? Bool) ?? false
@@ -238,8 +263,6 @@ enum UsageFetcher {
                     out.append(Gauge(key: "weekly", label: "Week \u{00B7} all models",
                                      percentUsed: pct, resetsAt: resets, isActive: active))
                 case "weekly_scoped":
-                    // Only worth a row once it has actually started moving.
-                    guard pct > 0 else { continue }
                     var name = "scoped"
                     if let scope = l["scope"] as? [String: Any] {
                         if let m = scope["model"] as? [String: Any],
@@ -248,7 +271,8 @@ enum UsageFetcher {
                                 let d = sf["display_name"] as? String, !d.isEmpty { name = d }
                     }
                     out.append(Gauge(key: "weekly_" + name.lowercased(), label: "Week \u{00B7} " + name,
-                                     percentUsed: pct, resetsAt: resets, isActive: active))
+                                     percentUsed: pct, resetsAt: resets, isActive: active,
+                                     note: allowance[index].map { String(format: "up to %.0f%% of week", $0) }))
                 default:
                     continue
                 }
@@ -271,6 +295,16 @@ enum UsageFetcher {
         return out.enumerated().sorted {
             (rank[$0.element.key] ?? 2, $0.offset) < (rank[$1.element.key] ?? 2, $1.offset)
         }.map(\.element)
+    }
+
+    private static func parseProducts(_ json: [String: Any]) -> [ProductShare] {
+        let breakdown = json["seven_day_breakdown"] as? [String: Any]
+        let rows = (breakdown?["rows"] as? [[String: Any]]) ?? []
+        return rows.compactMap { row in
+            guard let name = row["display_name"] as? String,
+                  let pct = row["percent"] as? Double, pct > 0 else { return nil }
+            return ProductShare(name: name, percent: pct)
+        }
     }
 
     private static func parseExtra(_ json: [String: Any]) -> ExtraCredits? {
@@ -357,17 +391,63 @@ enum Style {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Menu bar icon: two stacked meters (top = session, bottom = week)
+// Per-model estimate
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum ModelEstimator {
+    /// Runs the bundled script. Calls back with nil if it fails, and never on the main queue.
+    static func run(since: Date, completion: @escaping (ModelEstimate?) -> Void) {
+        guard let script = Bundle.main.url(forResource: "claude-usage-models", withExtension: nil) else {
+            completion(nil)
+            return
+        }
+        DispatchQueue.global(qos: .utility).async {
+            let proc = Process()
+            let out = Pipe()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            proc.arguments = [script.path, "--json", "--since", ISO8601DateFormatter().string(from: since)]
+            proc.standardOutput = out
+            proc.standardError = FileHandle.nullDevice
+            proc.qualityOfService = .utility
+            do { try proc.run() } catch {
+                UsageFetcher.log("model estimate: could not start (\(error.localizedDescription))")
+                completion(nil)
+                return
+            }
+            let killer = DispatchWorkItem { proc.terminate() }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 60, execute: killer)
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            killer.cancel()
+            let estimate = proc.terminationStatus == 0 ? parse(data) : nil
+            if estimate == nil { UsageFetcher.log("model estimate: failed, exit \(proc.terminationStatus)") }
+            completion(estimate)
+        }
+    }
+
+    private static func parse(_ data: Data) -> ModelEstimate? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = json["models"] as? [[String: Any]] else { return nil }
+        return ModelEstimate(
+            models: rows.compactMap { row in
+                guard let name = row["name"] as? String, let share = row["share"] as? Double else { return nil }
+                return ModelShare(name: name, share: share)
+            },
+            hosts: (json["hosts"] as? [String]) ?? [],
+            unreachable: (json["unreachable"] as? [String]) ?? [])
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Menu bar icon: one meter for the week, with a second above it for a 5-hour
+// session limit on plans that still have one
 // ─────────────────────────────────────────────────────────────────────────────
 
 func meterImage(sessionUsed: Double?, weekUsed: Double?) -> NSImage {
     let w: CGFloat = 17, h: CGFloat = 13
     let img = NSImage(size: NSSize(width: w, height: h), flipped: false) { _ in
-        let barH: CGFloat = 4.5, gap: CGFloat = 2.5
-        let top = NSRect(x: 0, y: h / 2 + gap / 2 - 1, width: w, height: barH)
-        let bot = NSRect(x: 0, y: h / 2 - gap / 2 - barH - 1, width: w, height: barH)
-
         func bar(_ frame: NSRect, _ used: Double?) {
+            let barH = frame.height
             let r = barH / 2
             NSColor.labelColor.withAlphaComponent(0.22).setFill()
             NSBezierPath(roundedRect: frame, xRadius: r, yRadius: r).fill()
@@ -380,8 +460,14 @@ func meterImage(sessionUsed: Double?, weekUsed: Double?) -> NSImage {
             NSBezierPath(roundedRect: NSRect(x: frame.minX, y: frame.minY, width: fw, height: barH),
                          xRadius: r, yRadius: r).fill()
         }
-        bar(top, sessionUsed)
-        bar(bot, weekUsed)
+        if let sessionUsed = sessionUsed {
+            let barH: CGFloat = 4.5, gap: CGFloat = 2.5
+            bar(NSRect(x: 0, y: h / 2 + gap / 2 - 1, width: w, height: barH), sessionUsed)
+            bar(NSRect(x: 0, y: h / 2 - gap / 2 - barH - 1, width: w, height: barH), weekUsed)
+        } else {
+            let barH: CGFloat = 6
+            bar(NSRect(x: 0, y: (h - barH) / 2, width: w, height: barH), weekUsed)
+        }
         return true
     }
     img.isTemplate = false
@@ -402,8 +488,53 @@ final class PanelView: NSView {
     // Mac health section: appears once the first sample is in.
     private let healthRowH: CGFloat = 36
     private let healthHeaderH: CGFloat = 30
-    var healthState = HealthPanelState() { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
+    var healthState = HealthPanelState() { didSet { invalidateIntrinsicContentSize(); needsDisplay = true; styleFreeButton() } }
     private var health: HealthAssessment? { healthState.assessment }
+
+    // Free Up Memory: a real button under the MAC rows (menu item views pass
+    // clicks to their controls). Red while memory is critical, orange on warn.
+    private let freeRowH: CGFloat = 40
+    let freeButton = NSButton(title: "Free Up Memory", target: nil, action: nil)
+    var onFreeMemory: (() -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        freeButton.bezelStyle = .rounded
+        freeButton.controlSize = .regular
+        freeButton.target = self
+        freeButton.action = #selector(freeClicked)
+        freeButton.isHidden = true
+        addSubview(freeButton)
+    }
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    @objc private func freeClicked() { onFreeMemory?() }
+
+    private var memoryLevel: HealthLevel { health?.level(for: .memory) ?? .ok }
+
+    private func styleFreeButton() {
+        freeButton.isHidden = health == nil
+        let lvl = memoryLevel
+        let pct = health?.sample.memFreePct
+        freeButton.title = lvl == .ok ? "Free Up Memory"
+            : "Free Up Memory" + (pct.map { " \u{00B7} \($0)% free" } ?? "")
+        freeButton.bezelColor = lvl == .critical ? .systemRed : lvl == .warn ? .systemOrange : nil
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        // The row sits right above the footer, which is where the MAC section ends.
+        freeButton.frame = NSRect(x: pad, y: pad + 24 + 6, width: bounds.width - pad * 2, height: 28)
+    }
+
+    // Rows under the gauges: where usage came from, and the split by model.
+    private let productH: CGFloat = 18
+    private let modelHeaderH: CGFloat = 26
+    private let modelRowH: CGFloat = 30
+    private let modelNoteH: CGFloat = 32
+    var estimate: ModelEstimate? { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
+    private var modelRows: [ModelShare] { estimate?.models ?? [] }
 
     private var rowCount: Int {
         var n = snapshot.gauges.count
@@ -411,14 +542,16 @@ final class PanelView: NSView {
         return n
     }
 
-    private var healthRowCount: Int { health == nil ? 0 : 4 }
+    private var healthRowCount: Int { health.map { healthRows($0).count } ?? 0 }
 
     override var intrinsicContentSize: NSSize {
         var h = pad + 20 + 8                       // header
         h += CGFloat(rowCount) * rowH
+        if !snapshot.products.isEmpty { h += productH }
+        if !modelRows.isEmpty { h += modelHeaderH + CGFloat(modelRows.count) * modelRowH + modelNoteH }
         if snapshot.error != nil { h += 38 }
         if rowCount == 0 && snapshot.error == nil { h += 34 }
-        if health != nil { h += healthHeaderH + CGFloat(healthRowCount) * healthRowH }
+        if health != nil { h += healthHeaderH + CGFloat(healthRowCount) * healthRowH + freeRowH }
         h += 24 + pad                              // footer
         return NSSize(width: PanelView.width, height: h)
     }
@@ -429,7 +562,7 @@ final class PanelView: NSView {
 
         // Header
         y -= 15
-        draw("CLAUDE USAGE",
+        draw("HEADROOM",
              font: .systemFont(ofSize: 10, weight: .semibold),
              color: .secondaryLabelColor, kern: 0.9,
              in: NSRect(x: pad, y: y, width: W - pad * 2, height: 15))
@@ -481,6 +614,37 @@ final class PanelView: NSView {
                  in: NSRect(x: pad, y: y, width: W - pad * 2, height: 20))
         }
 
+        // Where this week's usage came from
+        if !snapshot.products.isEmpty {
+            y -= productH
+            let text = snapshot.products
+                .map { String(format: "%@ %.0f%%", $0.name, $0.percent) }
+                .joined(separator: " \u{00B7} ")
+            draw("This week: " + text, font: .systemFont(ofSize: 10.5), color: .secondaryLabelColor,
+                 in: NSRect(x: pad + 12, y: y + 3, width: W - pad * 2 - 12, height: 14))
+        }
+
+        // Estimated split by model
+        if !modelRows.isEmpty, let e = estimate {
+            y -= modelHeaderH
+            draw("WEEK BY MODEL", font: .systemFont(ofSize: 10, weight: .semibold),
+                 color: .secondaryLabelColor, kern: 0.9,
+                 in: NSRect(x: pad, y: y + 4, width: W - pad * 2, height: 15))
+            draw("estimate", font: .systemFont(ofSize: 10, weight: .semibold),
+                 color: .tertiaryLabelColor, align: .right,
+                 in: NSRect(x: pad, y: y + 4, width: W - pad * 2, height: 15))
+            for m in modelRows {
+                y -= modelRowH
+                drawModelRow(m, in: NSRect(x: pad, y: y, width: W - pad * 2, height: modelRowH))
+            }
+            y -= modelNoteH
+            var note = "Share of Claude Code tokens, weighted by API price. From "
+                + e.hosts.joined(separator: " + ") + "."
+            if !e.unreachable.isEmpty { note += " " + e.unreachable.joined(separator: ", ") + " not reachable." }
+            draw(note, font: .systemFont(ofSize: 10), color: .tertiaryLabelColor, lines: 2,
+                 in: NSRect(x: pad + 12, y: y + 2, width: W - pad * 2 - 12, height: 28))
+        }
+
         // Mac health
         if let h = health {
             y -= healthHeaderH
@@ -496,6 +660,7 @@ final class PanelView: NSView {
                 y -= healthRowH
                 drawKeyValueRow(row, in: NSRect(x: pad, y: y, width: W - pad * 2, height: healthRowH))
             }
+            y -= freeRowH          // the Free Up Memory button (a subview, see layout())
         }
 
         // Footer
@@ -512,11 +677,29 @@ final class PanelView: NSView {
     private func drawGaugeRow(_ g: Gauge, in rect: NSRect) {
         drawMeterRow(title: g.label,
                      value: String(format: "%.0f%% left", g.percentLeft),
-                     sub: Style.countdown(to: g.resetsAt),
+                     sub: (g.note.map { $0 + " \u{00B7} " } ?? "") + Style.countdown(to: g.resetsAt),
                      percentUsed: g.percentUsed,
                      tint: Style.tint(forUsed: g.percentUsed),
                      active: g.isActive,
                      in: rect)
+    }
+
+    private func drawModelRow(_ m: ModelShare, in rect: NSRect) {
+        let gutter: CGFloat = 12
+        let top = NSRect(x: rect.minX + gutter, y: rect.maxY - 17, width: rect.width - gutter, height: 15)
+        draw(m.name, font: .systemFont(ofSize: 12, weight: .medium), color: .secondaryLabelColor, in: top)
+        draw(m.share < 1 ? "<1%" : String(format: "%.0f%%", m.share),
+             font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
+             color: .secondaryLabelColor, align: .right, in: top)
+
+        let h: CGFloat = 4
+        let track = NSRect(x: rect.minX + gutter, y: rect.maxY - 25, width: rect.width - gutter, height: h)
+        NSColor.quaternaryLabelColor.setFill()
+        NSBezierPath(roundedRect: track, xRadius: h / 2, yRadius: h / 2).fill()
+        let fw = max(h, track.width * CGFloat(min(100, max(0, m.share))) / 100)
+        NSColor.controlAccentColor.setFill()
+        NSBezierPath(roundedRect: NSRect(x: track.minX, y: track.minY, width: fw, height: h),
+                     xRadius: h / 2, yRadius: h / 2).fill()
     }
 
     private func drawMeterRow(title: String, value: String, sub: String,
@@ -599,6 +782,19 @@ final class PanelView: NSView {
             load = KeyValueRow(title: "Load", value: "unavailable", sub: "getloadavg failed", level: lvl(.load))
         }
 
+        // Disk always carries its colour: low space is worth seeing even when
+        // nothing else is wrong yet.
+        var disk: KeyValueRow?
+        if let d = s.disk {
+            let usedPct = d.totalBytes > 0 ? Int((d.totalBytes - d.freeBytes) * 100 / d.totalBytes) : 0
+            disk = KeyValueRow(
+                title: "Disk",
+                value: "\(Style.bytes(d.freeBytes)) free",
+                sub: "\(usedPct)% used of \(Style.bytes(d.totalBytes))"
+                    + (h.level(for: .disk) == .ok ? "" : " \u{00B7} Speed Up can clear caches"),
+                level: h.level(for: .disk))
+        }
+
         let n = s.claude.interactiveSessions.count, m = s.claude.summarizers.count
         var claudeSub = "\(Style.bytes(s.claude.totalRSS)) resident"
         if let oldest = s.claude.oldestSession {
@@ -631,7 +827,7 @@ final class PanelView: NSView {
             action = KeyValueRow(title: "Last action", value: "\(k) suspected leak\(k == 1 ? "" : "s")",
                                  sub: checked)
         }
-        return [memory, load, claude, action]
+        return [memory, load] + (disk.map { [$0] } ?? []) + [claude, action]
     }
 
     /// Two-column row without a meter: title left, value right, sub below.
@@ -683,16 +879,45 @@ enum LoginItem {
     }
     static var isEnabled: Bool { FileManager.default.fileExists(atPath: plistURL.path) }
 
+    /// The widget is also the leak reaper, so it must not stay down. launchd
+    /// relaunches it after a crash, a signal or a jetsam kill (any unsuccessful
+    /// exit), 30 s apart at most; Quit exits 0 and stays quit. On 2026-11-06 it
+    /// was down for 1h40 and 56 summarizers piled up meanwhile.
+    static func plist(executable exe: String) -> [String: Any] {
+        [
+            "Label": label,
+            "ProgramArguments": [exe],
+            "RunAtLoad": true,
+            "KeepAlive": ["SuccessfulExit": false],
+            "ThrottleInterval": 30,
+            "ProcessType": "Interactive",
+        ]
+    }
+
+    /// Plists written before auto-restart existed lack KeepAlive: rewrite them
+    /// in place. launchd picks the change up at the next login or bootstrap
+    /// (build.sh does one), never by killing the running copy.
+    static func upgradeIfNeeded() {
+        guard isEnabled,
+              let data = try? Data(contentsOf: plistURL),
+              let old = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let oldExe = (old["ProgramArguments"] as? [String])?.first
+        else { return }
+        // Also follow a rename (Claude Usage.app became Headroom.app on 2026-11-09).
+        let current = Bundle.main.bundleURL.pathExtension == "app" ? Bundle.main.executableURL?.path : nil
+        let exe = current ?? oldExe
+        guard old["KeepAlive"] == nil || exe != oldExe,
+              let out = try? PropertyListSerialization.data(fromPropertyList: plist(executable: exe),
+                                                            format: .xml, options: 0)
+        else { return }
+        try? out.write(to: plistURL)
+    }
+
     static func setEnabled(_ on: Bool) {
         let fm = FileManager.default
         if on {
             let exe = Bundle.main.executableURL?.path ?? CommandLine.arguments[0]
-            let plist: [String: Any] = [
-                "Label": label,
-                "ProgramArguments": [exe],
-                "RunAtLoad": true,
-                "ProcessType": "Interactive",
-            ]
+            let plist = plist(executable: exe)
             try? fm.createDirectory(at: plistURL.deletingLastPathComponent(),
                                     withIntermediateDirectories: true)
             if let data = try? PropertyListSerialization.data(fromPropertyList: plist,
@@ -738,12 +963,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private var health: HealthAssessment? { healthState.assessment }
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        LoginItem.upgradeIfNeeded()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.imagePosition = .imageLeading
         render()
 
         buildMenu()
         statusItem.menu = menu
+        panel.onFreeMemory = { [weak self] in self?.freeMemory() }
+        // Debug: open Free Up Memory at launch (for screenshots of the live window).
+        if CommandLine.arguments.contains("--relief-window") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.freeMemory() }
+        }
 
         // Health first: it must never wait behind a slow Keychain call.
         healthMonitor.onUpdate = { [weak self] state in
@@ -789,6 +1020,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         refreshItem.target = self
         menu.addItem(refreshItem)
 
+        let freeItem = NSMenuItem(title: "Free Up Memory\u{2026}", action: #selector(freeMemory), keyEquivalent: "m")
+        freeItem.target = self
+        menu.addItem(freeItem)
+
+        let speedItem = NSMenuItem(title: "Speed Up\u{2026}", action: #selector(speedUp), keyEquivalent: "u")
+        speedItem.target = self
+        menu.addItem(speedItem)
+
         let reapItem = NSMenuItem(title: "Reap Leaks Now", action: #selector(reapNow), keyEquivalent: "k")
         reapItem.target = self
         menu.addItem(reapItem)
@@ -814,7 +1053,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         menu.addItem(loginToggle)
 
         menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit Claude Usage", action: #selector(quit), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "Quit Headroom", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
     }
@@ -834,10 +1073,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private var lastFetchStarted = Date.distantPast
+    private var lastEstimateStarted = Date.distantPast
 
     @objc private func refreshNow() { refresh(force: true) }
 
     @objc private func reapNow() { healthMonitor.poll(manual: true) }
+
+    /// One click: clears the leaks at once, then opens the window that lists
+    /// what else holds memory and measures again after each close.
+    @objc private func freeMemory() {
+        menu.cancelTracking()
+        let low = (health?.level(for: .memory) ?? .ok) != .ok
+        // Let the menu finish closing before a window takes focus.
+        DispatchQueue.main.async { [weak self] in
+            Relief.open(lowMemory: low) { self?.healthMonitor.poll() }
+        }
+    }
+
+    @objc private func speedUp() {
+        SpeedUp.present(suspected: healthState.suspected,
+                        assessment: health,
+                        reapLeaks: { [weak self] in self?.healthMonitor.poll(manual: true) },
+                        recheck: { [weak self] in self?.healthMonitor.poll() })
+    }
 
     /// Lists the current targets and offers to terminate them (a manual reap,
     /// which runs whether or not auto-reap is on).
@@ -890,6 +1148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                 // Keep the last good reading visible through a transient failure.
                 if snap.error != nil, snap.gauges.isEmpty, !self.snapshot.gauges.isEmpty {
                     snap.gauges = self.snapshot.gauges
+                    snap.products = self.snapshot.products
                     snap.extra = self.snapshot.extra
                     snap.fetchedAt = self.snapshot.fetchedAt
                     snap.stale = true
@@ -898,6 +1157,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                 self.panel.snapshot = snap
                 self.panel.frame = NSRect(origin: .zero, size: self.panel.intrinsicContentSize)
                 self.render()
+                self.refreshEstimate()
+            }
+        }
+    }
+
+    /// The week starts seven days before it resets. Reading the logs costs no API
+    /// call, but it does wake every listed Mac, so every 15 minutes is plenty.
+    private func refreshEstimate() {
+        guard let resets = snapshot.weekly?.resetsAt,
+              Date().timeIntervalSince(lastEstimateStarted) >= 900 else { return }
+        lastEstimateStarted = Date()
+        ModelEstimator.run(since: resets.addingTimeInterval(-7 * 86400)) { [weak self] estimate in
+            guard let estimate = estimate else { return }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.panel.estimate = estimate
+                self.panel.frame = NSRect(origin: .zero, size: self.panel.intrinsicContentSize)
             }
         }
     }
@@ -913,9 +1189,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         if snapshot.error != nil && snapshot.gauges.isEmpty {
             text = " \u{2013}\u{2013}"
             color = .tertiaryLabelColor
-        } else if let s = s, let w = w {
-            text = String(format: " %.0f%% \u{00B7} %.0f%%", max(0, 100 - s), max(0, 100 - w))
-            let worst = max(s, w)
+        } else if let w = w {
+            // A 5-hour limit only comes back for plans and accounts that have one.
+            if let s = s {
+                text = String(format: " %.0f%% \u{00B7} %.0f%%", max(0, 100 - s), max(0, 100 - w))
+            } else {
+                text = String(format: " %.0f%%", max(0, 100 - w))
+            }
+            let worst = max(s ?? 0, w)
             if worst >= 80 { color = Style.tint(forUsed: worst) }
         } else {
             text = " \u{2026}"
@@ -926,7 +1207,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium),
             .foregroundColor: color,
         ])
-        var tip = snapshot.error ?? "Claude usage remaining \u{2014} session \u{00B7} week"
+        var tip = snapshot.error ?? (s == nil ? "Claude usage left this week"
+                                              : "Claude usage left: session \u{00B7} week")
         // Mac health: a coloured dot in front of the text, only when not ok.
         if let h = health, h.level != .ok {
             title.insert(healthDot(h.level), at: 0)
@@ -993,11 +1275,41 @@ if CommandLine.arguments.contains("--reap-dry-run") {
     exit(0)
 }
 
+// Debug: what Speed Up would offer right now (jobs, caches with sizes), no action.
+if CommandLine.arguments.contains("--speedup-dry-run") {
+    print(SpeedUp.dryRun())
+    exit(0)
+}
+
+// Debug: render the Speed Up dialog with synthetic rows to a PNG.
+if let i = CommandLine.arguments.firstIndex(of: "--speedup-snapshot"),
+   CommandLine.arguments.count > i + 1 {
+    NSApplication.shared.setActivationPolicy(.prohibited)
+    SpeedUp.snapshot(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]),
+                     dark: CommandLine.arguments.contains("--dark"))
+    exit(0)
+}
+
+// Debug: what Free Up Memory would list right now, no action.
+if CommandLine.arguments.contains("--relief-dry-run") {
+    print(Relief.dryRun())
+    exit(0)
+}
+
+// Debug: render the Free Up Memory window with synthetic rows to a PNG.
+if let i = CommandLine.arguments.firstIndex(of: "--relief-snapshot"),
+   CommandLine.arguments.count > i + 1 {
+    NSApplication.shared.setActivationPolicy(.prohibited)
+    ReliefWindow.snapshot(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]),
+                          dark: CommandLine.arguments.contains("--dark"))
+    exit(0)
+}
+
 // Debug: post one test notification through the same path the reaper uses.
 if CommandLine.arguments.contains("--notify-test") {
     NSApplication.shared.setActivationPolicy(.prohibited)
     HealthNotifier.requestAuthorization()
-    HealthNotifier.post(title: "Claude Usage reaped leaks", body: "37 summarizers terminated \u{00B7} 2.1 GB was resident (test)") {
+    HealthNotifier.post(title: "Headroom reaped leaks", body: "37 summarizers terminated \u{00B7} 2.1 GB was resident (test)") {
         print($0)
     }
     RunLoop.main.run(until: Date().addingTimeInterval(3))
@@ -1010,7 +1322,8 @@ if let i = CommandLine.arguments.firstIndex(of: "--icon"),
     let out = URL(fileURLWithPath: CommandLine.arguments[i + 1])
     let dark = CommandLine.arguments.contains("--dark")
     NSApplication.shared.setActivationPolicy(.prohibited)
-    let sessionUsed = 78.0, weekUsed = 34.0
+    let sessionUsed: Double? = CommandLine.arguments.contains("--session") ? 78 : nil
+    let weekUsed = 34.0
     renderPNG(to: out, size: NSSize(width: 104, height: 24), scale: 4, dark: dark) { rect in
         (dark ? NSColor(white: 0.17, alpha: 1) : NSColor(white: 0.94, alpha: 1)).setFill()
         rect.fill()
@@ -1018,7 +1331,8 @@ if let i = CommandLine.arguments.firstIndex(of: "--icon"),
         let x: CGFloat = 12
         icon.draw(at: NSPoint(x: x, y: (rect.height - icon.size.height) / 2),
                   from: .zero, operation: .sourceOver, fraction: 1)
-        let label = String(format: " %.0f%% \u{00B7} %.0f%%", 100 - sessionUsed, 100 - weekUsed)
+        let label = sessionUsed.map { String(format: " %.0f%% \u{00B7} %.0f%%", 100 - $0, 100 - weekUsed) }
+            ?? String(format: " %.0f%%", 100 - weekUsed)
         let title = NSMutableAttributedString(string: label, attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium),
             .foregroundColor: NSColor.labelColor,
@@ -1043,16 +1357,20 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
     var snap = Snapshot()
     if CommandLine.arguments.contains("--demo") {
         // Synthetic data for documentation shots: no network, no real numbers.
-        snap.plan = "Max 5x"
+        snap.plan = "Ultra"
         snap.fetchedAt = Date()
         snap.gauges = [
-            Gauge(key: "session", label: "Session \u{00B7} 5 hours", percentUsed: 78,
-                  resetsAt: Date().addingTimeInterval(77 * 60), isActive: true),
             Gauge(key: "weekly", label: "Week \u{00B7} all models", percentUsed: 34,
-                  resetsAt: Date().addingTimeInterval(3.4 * 86400), isActive: false),
-            Gauge(key: "weekly_opus", label: "Week \u{00B7} Opus", percentUsed: 56,
-                  resetsAt: Date().addingTimeInterval(3.4 * 86400), isActive: false),
+                  resetsAt: Date().addingTimeInterval(3.4 * 86400), isActive: true),
+            Gauge(key: "weekly_fable", label: "Week \u{00B7} Fable", percentUsed: 12,
+                  resetsAt: Date().addingTimeInterval(3.4 * 86400), isActive: false,
+                  note: "up to 50% of week"),
         ]
+        if CommandLine.arguments.contains("--session") {
+            snap.gauges.insert(Gauge(key: "session", label: "Session \u{00B7} 5 hours", percentUsed: 78,
+                                     resetsAt: Date().addingTimeInterval(77 * 60), isActive: true), at: 0)
+        }
+        snap.products = [ProductShare(name: "Claude Code", percent: 92), ProductShare(name: "Chats", percent: 8)]
         if CommandLine.arguments.contains("--stale") {
             // Preview the rate-limited state: last good numbers + amber banner.
             snap.fetchedAt = Date().addingTimeInterval(-11 * 60)
@@ -1068,6 +1386,16 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
     let view = PanelView()
     view.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
     view.snapshot = snap
+    if CommandLine.arguments.contains("--demo") {
+        view.estimate = ModelEstimate(
+            models: [ModelShare(name: "Opus 5.5", share: 71), ModelShare(name: "Fable 5.1", share: 18),
+                     ModelShare(name: "Sonnet 5.5", share: 10), ModelShare(name: "Haiku 5.5", share: 0.6)],
+            hosts: ["This Mac", "Mini"], unreachable: [])
+    } else if let resets = snap.weekly?.resetsAt {
+        let sema = DispatchSemaphore(value: 0)
+        ModelEstimator.run(since: resets.addingTimeInterval(-7 * 86400)) { view.estimate = $0; sema.signal() }
+        _ = sema.wait(timeout: .now() + 70)
+    }
     if CommandLine.arguments.contains("--demo") {
         // A Mac under pressure, so the section shows its colour in the shot.
         let now = Date()
@@ -1087,7 +1415,8 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
             swap: SwapStats(usedBytes: 4_500 << 20, totalBytes: 9_200 << 20),
             load: LoadStats(load1: 62.9, load5: 32.8, load15: 4.5), ncpu: 14,
             kernelPressure: "critical", sampledAt: now, claude: stack, sampleMillis: 12,
-            validity: Validity(memory: true, vm: true, swap: true, load: true))
+            validity: Validity(memory: true, vm: true, swap: true, load: true, disk: true),
+            disk: DiskStats(freeBytes: 14 << 30, totalBytes: 926 << 30))
         var earlier = sample
         earlier.sampledAt = now.addingTimeInterval(-HealthScorer.promotionAge)
         _ = HealthScorer.assess(earlier)
@@ -1112,6 +1441,13 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
         (dark ? NSColor(white: 0.13, alpha: 1) : NSColor(white: 0.97, alpha: 1)).setFill()
         rect.fill()
         view.draw(rect)
+        // The Free Up Memory button is a subview; draw() alone leaves it out.
+        view.layout()
+        let btn = view.freeButton
+        if !btn.isHidden, let rep = btn.bitmapImageRepForCachingDisplay(in: btn.bounds) {
+            btn.cacheDisplay(in: btn.bounds, to: rep)
+            rep.draw(in: btn.frame)
+        }
     }
     print("wrote \(out.path)  \(Int(view.bounds.width))x\(Int(view.bounds.height))")
     exit(0)

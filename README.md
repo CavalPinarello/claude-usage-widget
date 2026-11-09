@@ -1,20 +1,37 @@
-# Claude Usage
+# Headroom
 
-A macOS menu bar widget for how much Claude quota you have left, in the two
-windows that actually gate you: the **5-hour session** and the **rolling week**.
+Headroom (called Claude Usage until 2026-11-09) is a macOS menu bar widget for
+two kinds of headroom: the RAM your Mac has left, and how much Claude quota you have left this week, and
+in the **5-hour session** too on plans that still have one.
 
 ![menu bar](docs/menubar.png)
 
-Two meters — session on top, week below — plus the remaining percentages. Colour
-goes green → yellow → orange → red as you burn through, and the text only picks
+One meter for the week plus the percentage left. Plans with a 5-hour limit get a
+second meter above it and two percentages (session, then week). Colour goes green → yellow → orange → red as you burn through, and the text only picks
 up colour past 80% used, so it stays quiet when there's nothing to worry about.
 
 Click it for the detail:
 
 ![panel](docs/panel.png)
 
-Per-model weekly caps (`Week · Opus` above) appear only once they are actually
-non-zero. An extra-usage-credits row appears only if you have credits enabled.
+A model with its own weekly cap (`Week · Fable` above) always gets a row, even
+at zero. An extra-usage-credits row appears only if you have credits enabled.
+
+## Week by model
+
+The usage API reports a percentage only for models with their own cap, so the
+**Week by model** section is an estimate from Claude Code's local logs. It totals
+each model's tokens since the week began, weights them by API list price, and
+shows each model's share. Read it as "where my Claude Code usage went", not as a
+percentage of a limit: Anthropic doesn't publish how plan limits weigh tokens,
+claude.ai chats and cloud sessions leave no local log, and Claude Code runs billed
+to an API key are counted even though they don't touch your plan. Prices live at
+the top of `bin/claude-usage-models` and need updating when Anthropic changes them.
+
+To count other Macs on the same account, list them in
+`~/.config/claude-usage/hosts`, one `Label ssh-target` per line. They need python3
+and key-based ssh, and the panel says so if one can't be reached. The estimate runs
+every 15 minutes and makes no API calls.
 
 ## Requirements
 
@@ -154,6 +171,13 @@ The panel and the menu bar dot stay uncoloured while the machine is fine.
 | **warn** (yellow) | memory < 35% free · load > 2.0 per core · ≥ 5 stale summarizers · Claude stack > 4 GB resident · any orphaned headless Chrome past its age limit |
 | **critical** (red) | memory < 15% free · swap > 6 GB with < 512 MB free · load > 4.0 per core · ≥ 20 stale summarizers |
 
+Disk (added 2026-11-07) has its own row and its own colour: **warn** under
+50 GB free, **critical** under 20 GB, measured with `statfs` on
+`/System/Volumes/Data` the way `df` does (purgeable space not counted). Swap
+files live on the same volume, so a nearly full disk is also a swap ceiling.
+A full disk colours the menu bar but never counts as an emergency, because
+killing summarizers frees no disk space.
+
 A level is promoted only when the previous sample was already at that level
 or worse *and* is at least 20 seconds old, so neither a single spike nor two
 back-to-back queued samples can light the menu bar; demotion is immediate. The
@@ -192,12 +216,37 @@ the last check found nothing. The last reap is also persisted
 
 ### Menu items
 
+- **Speed Up…** (⌘U): one dialog listing what can be done right now, as
+  checkboxes. Nothing runs until you press **Speed Up**.
+  - *Leaks* the reaper already knows about (ticked).
+  - *Heavy jobs*: Xcode builds and tests (`xcodebuild`), booted iOS
+    simulators and `ffmpeg` renders, each with its age, process count and
+    CPU (never ticked: they belong to someone's work). A job is signalled
+    (`SIGTERM`) only if the same pid still runs the same full command line;
+    a simulator goes through `xcrun simctl shutdown`.
+  - *Rebuildable caches* with their sizes, from a fixed list (uv, Codex,
+    Playwright, Adobe Camera Raw, pip). Ticked only while the disk is low.
+    uv is cleared with `uv cache clean`. Nothing outside that list is
+    ever deleted; Xcode DeviceSupport and DerivedData are left out on purpose.
+  Every action is logged to `~/.claude-mem/hygiene.log` as `widget: speed-up: …`,
+  and a notification sums up what was done.
 - **Reap Leaks Now** (⌘K): sample and reap, toggle or not.
 - **Auto-reap Leaks**: the `health.autoReap` toggle.
 - **Suspected Leaks…**: enabled only while there are targets; lists each one
   (pid, age, resident MB, owner) with a **Terminate** button that runs a
   manual reap, and **Cancel**.
 - **Open Activity Monitor**: for when you want to see the rest.
+
+### Staying up
+
+The widget is also the leak reaper, so it must not stay down (on 2026-11-06
+it was gone for 1h40 and 56 summarizers piled up). The LaunchAgent carries
+`KeepAlive: {SuccessfulExit: false}` with a 30 s `ThrottleInterval`: launchd
+brings it back after a crash, a signal or a memory kill (tested: `kill -9`,
+back in 28 s), while **Quit** exits cleanly and stays quit. Older plists are
+upgraded in place at launch and take effect at the next login or `build.sh`.
+`build.sh` now boots the job out of launchd before building and bootstraps it
+afterwards, so a rebuild never races an automatic relaunch.
 
 ### Opting out and tuning
 
@@ -216,6 +265,8 @@ defaults write com.claudeusage.widget health.pollSeconds -int 30
 "$HOME/Applications/Claude Usage.app/Contents/MacOS/ClaudeUsage" --reap-dry-run   # what a reap would kill, without killing
 "$HOME/Applications/Claude Usage.app/Contents/MacOS/ClaudeUsage" --notify-test    # one test notification through the reaper's path
 "$HOME/Applications/Claude Usage.app/Contents/MacOS/ClaudeUsage" --argv-selftest  # KERN_PROCARGS2 parser + fingerprint fixtures; non-zero exit on any failure
+"$HOME/Applications/Claude Usage.app/Contents/MacOS/ClaudeUsage" --speedup-dry-run                 # what Speed Up would offer now, cache sizes included
+"$HOME/Applications/Claude Usage.app/Contents/MacOS/ClaudeUsage" --speedup-snapshot out.png         # the dialog with synthetic rows, as a PNG (light only)
 ```
 
 `--health-json` reports `level` after the hysteresis (it assesses the sample
@@ -226,6 +277,27 @@ lists every process it classified with its first three arguments.
 missing terminator, argc larger than the payload, empty argument, bad UTF-8)
 and the option scanner against `--` handling; the parser is a kill gate, so it
 fails closed on anything it cannot read.
+
+## Free Up Memory
+
+The button under the MAC rows (also the menu, ⌘M) turns orange when memory is
+under 35% free and red under 15%. One click clears the leaks the reaper already
+owns, at any age while memory is low, then opens a window:
+
+- **Before → Now**: memory free, swap and compressed, measured again after
+  every action and on Recheck.
+- **Claude Code sessions** with their MCP servers, by physical footprint, with
+  folder, age, keyboard idle time and tmux session. Detached or 3 h idle
+  sessions are marked suggested. Close kills the tmux pane, or sends SIGTERM.
+- **Simulators** (Shut Down), **apps** over 300 MB (Quit, so they can ask to
+  save; a terminal hosting sessions says so), **background processes** over
+  800 MB started by launchd (Stop). Apps and background processes are never
+  suggested.
+
+A second click on a row that survived escalates to SIGKILL / force quit. Every
+signal re-checks pid and start time first and is logged to
+`~/.claude-mem/hygiene.log`. Debug: `--relief-dry-run`, `--relief-snapshot
+out.png`, `--relief-window` (opens the live window at launch).
 
 ## Rate limiting
 
@@ -262,8 +334,14 @@ bin/claude-usage --json    # raw API response
 ```
 
 ```
-  ● Session (5h)     [####....................]  83% left   resets in 4h 3m (Thu 17:00)
-    Week (all)       [#.......................]  97% left   resets in 3d 13h (Mon 02:00)
+  * Week (all)       [####....................]  83% left   resets in 3d 5h (Mon 01:00)
+    Week (Fable)     [........................] 100% left   up to 50% of week, resets in 3d 5h (Mon 01:00)
+    This week: Claude Code 99%, Other 1%
+
+  Estimated split by model since Mon Nov 02 01:00 (This Mac + Mini)
+    Opus 5.5       92.5%   $395.14      3892 messages
+    Haiku 5.5       6.3%   $26.95        494 messages
+    Sonnet 5.5      1.2%   $5.00         170 messages
 ```
 
 Symlink it onto your `PATH` if you want it in a shell prompt or a Claude Code
@@ -290,12 +368,17 @@ above are produced.
 | `build.sh` | compile + ad-hoc sign + relaunch |
 | `uninstall.sh` | remove app, login item, LaunchAgent |
 | `bin/claude-usage` | the same query, in the terminal |
+| `bin/claude-usage-models` | the per-model estimate; `build.sh` copies it into the app |
 
 ## Notes on the API shape
 
 The response carries a `limits[]` array (`kind`: `session`, `weekly_all`,
 `weekly_scoped`) which the widget prefers, falling back to the older flat
-`five_hour` / `seven_day` objects if a future build drops it. `resets_at` jitters
+`five_hour` / `seven_day` objects if a future build drops it. The `session` entry
+is absent for verified Ultra accounts, which have no 5-hour limit, and Opus and
+Sonnet no longer have entries. `weekly_scoped_shares` gives a scoped limit's
+allowance as a share of the week, matched to `limits[]` by `limit_index`.
+`seven_day_breakdown` splits the week by product. `resets_at` jitters
 across the minute boundary (`…T14:59:59.99…`), so timestamps are rounded to the
 nearest second before display — truncating renders "4:59 PM" for a 5:00 reset.
 `spend` drives the extra-usage-credits row.
