@@ -1,14 +1,23 @@
 # Headroom
 
-Headroom (called Claude Usage until 2026-11-09) is a macOS menu bar widget for
-two kinds of headroom: the RAM your Mac has left, and how much Claude quota you have left this week, and
-in the **5-hour session** too on plans that still have one.
+<p align="center"><img src="docs/mascot-fast.png" width="420" alt="A cartoon computer in sunglasses and a red cape, speeding past"></p>
+
+Headroom is a macOS menu bar widget for two kinds of headroom: how much Claude
+you have left this week (and in the 5-hour session, on plans that still have
+one), and how much memory your Mac has left before it slows down. When either
+gets tight, one click helps.
+
+Made by **Martin Kawalski**. It was called Claude Usage until 2026-11-09.
 
 ![menu bar](docs/menubar.png)
 
-One meter for the week plus the percentage left. Plans with a 5-hour limit get a
-second meter above it and two percentages (session, then week). Colour goes green → yellow → orange → red as you burn through, and the text only picks
-up colour past 80% used, so it stays quiet when there's nothing to worry about.
+The ring fills with what is left: the outer ring is the week, the inner ring the
+5-hour session. Next to it, small columns give the same numbers as text. They go
+green, yellow, orange and red as you use them up, and the text only takes a
+colour past 80% used. When the Mac itself is in trouble a third column appears,
+here memory at 9% free:
+
+![menu bar with a memory warning](docs/menubar-warn.png)
 
 Click it for the detail:
 
@@ -33,20 +42,57 @@ To count other Macs on the same account, list them in
 and key-based ssh, and the panel says so if one can't be reached. The estimate runs
 every 15 minutes and makes no API calls.
 
-## Requirements
-
-- macOS 13 or later
-- Xcode command line tools (`xcode-select --install`) — you build it yourself
-- Claude Code, logged in with a **subscription account** (Pro or Max)
-
-It reads the OAuth login Claude Code already stores. If you drive Claude Code
-with an `ANTHROPIC_API_KEY`, or through Bedrock/Vertex, there is no subscription
-quota to report and the widget will say it found no login.
-
 ## Install
 
+### From the disk image
+
+1. Download `Headroom-1.1.dmg` from the Releases page, or build one yourself with
+   `tools/make-dmg.sh` (it lands in `dist/`).
+2. Open it and drag **Headroom** onto **Applications**.
+3. Open Headroom from Applications. It is signed ad hoc, not notarized, so the
+   first time macOS says it cannot check it. Open **System Settings > Privacy &
+   Security**, scroll down, and click **Open Anyway**.
+
+If you open it straight from the disk image, the setup window offers to move it
+to Applications for you and restarts from there.
+
+### First-run setup
+
+![setup](docs/setup.png)
+
+Four short pages:
+
+- **Meet Headroom**, with the move to Applications if needed.
+- **Connect to Claude.** Headroom finds the login Claude Code keeps in your
+  Keychain and makes one test call to Anthropic's usage API. There is no API key
+  to paste and nothing extra is billed. If Claude Code is not installed or not
+  signed in, the page says so, copies the install command
+  (`curl -fsSL https://claude.ai/install.sh | bash`) and checks again once you
+  have run `claude` and signed in. macOS may ask once whether `security` may
+  read the item: choose Always Allow.
+- **A few choices**: open at login, warn before the Mac slows down, clear
+  leaked Claude helpers automatically. All three stay in the menu afterwards.
+- **Done**, with the faster Mac.
+
+**Setup & About…** (⌘,) in the menu opens it again.
+
+### Requirements
+
+- macOS 13 or later, Apple silicon or Intel (the DMG is universal)
+- Claude Code, signed in with a **subscription account** (Pro, Max or Ultra)
+- To build from source: Xcode command line tools (`xcode-select --install`)
+
+It reads the OAuth login Claude Code already stores. If you drive Claude Code
+with an `ANTHROPIC_API_KEY`, or through Bedrock or Vertex, there is no
+subscription quota to report and the widget says it is not connected.
+
+The **Week by model** estimate needs python3, which comes with the command line
+tools. Without them that section simply stays hidden.
+
+### From source
+
 ```sh
-git clone <this repo> claude-usage-widget
+git clone https://github.com/CavalPinarello/claude-usage-widget
 cd claude-usage-widget
 ./build.sh
 ```
@@ -57,7 +103,7 @@ it. Because you built it locally there is no Gatekeeper quarantine and no
 
 **Open at Login** is a toggle in the widget's own menu. It writes
 `~/Library/LaunchAgents/com.claudeusage.widget.plist` and bootstraps it with
-`launchctl` — no Developer ID needed.
+`launchctl`, so no Developer ID is needed.
 
 To remove everything: `./uninstall.sh`
 
@@ -219,7 +265,9 @@ the last check found nothing. The last reap is also persisted
 - **Speed Up Mac…** (⌘U) and **Free Up Disk Space…** (⌘D): see above.
 - **Warn Before It Slows Down**: the `health.earlyWarning` toggle.
 - **Clear Leaks Automatically**: the `health.autoReap` toggle.
-- **Open at Login**, **Quit Headroom**.
+- **Open at Login**.
+- **Setup & About…** (⌘,): the first-run setup again, with the version and credit.
+- **Quit Headroom**.
 
 ### Staying up
 
@@ -356,7 +404,10 @@ statusline.
 ./build.sh                                     # compile, sign, relaunch
 "$HOME/Applications/Headroom.app/Contents/MacOS/Headroom" \
     --snapshot out.png [--demo [--stale]] [--dark]  # render the dropdown panel
-    --icon out.png [--dark] [--health warn|critical]  # render the menu bar item
+    --icon out.png [--session] [--dark] [--health warn|critical]  # render the menu bar item
+    --mascot out.png [--sluggish]                  # render the cartoon Mac
+    --setup-window [0-3] [--dark]                  # open the setup window on a page
+tools/make-dmg.sh                              # universal build into dist/Headroom-<version>.dmg
 ```
 
 The two renderers draw straight to a PNG under an explicit appearance, so you can
@@ -368,7 +419,11 @@ above are produced.
 |---|---|
 | `Sources/main.swift` | fetch, parse, menu bar item, panel, login item, debug flags |
 | `Sources/Health.swift` | Mac health: sensing (Mach + libproc), scoring, reaping, notifications |
-| `build.sh` | compile + ad-hoc sign + relaunch |
+| `Sources/Relief.swift`, `Sources/SpeedUp.swift` | the Speed Up Mac and Disk Space windows |
+| `Sources/Setup.swift` | first-run setup, move to Applications |
+| `Sources/Mascot.swift` | the cartoon Mac, drawn in code |
+| `tools/make-dmg.sh` | the disk image |
+| `build.sh` | compile + ad-hoc sign + relaunch (or a standalone copy for the DMG) |
 | `uninstall.sh` | remove app, login item, LaunchAgent |
 | `bin/claude-usage` | the same query, in the terminal |
 | `bin/claude-usage-models` | the per-model estimate; `build.sh` copies it into the app |
@@ -390,6 +445,8 @@ This is an undocumented internal endpoint. It can change without warning; the
 parser is defensive about missing fields, but if Anthropic reshapes it, this
 breaks until someone updates the parser.
 
-## License
+## Credits and license
 
-MIT — see [LICENSE](LICENSE).
+Made by Martin Kawalski. MIT, see [LICENSE](LICENSE).
+
+<p align="center"><img src="docs/mascot-sluggish.png" width="300" alt="The same computer before: sweating, half asleep, too many windows open"><br><sub>Before Headroom.</sub></p>

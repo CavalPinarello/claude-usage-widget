@@ -63,7 +63,7 @@ enum UsageError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .noCredentials:   return "No Claude Code login found in Keychain"
+        case .noCredentials:   return "Not connected to Claude yet \u{2013} open Setup from the menu"
         case .tokenExpired:    return "Login expired \u{2013} open Claude Code to refresh"
         case .http(401), .http(403): return "Login rejected \u{2013} open Claude Code to refresh"
         case .http(429):       return "Usage API rate limited \u{2013} will retry"
@@ -156,6 +156,19 @@ enum UsageFetcher {
         let tier = (oauth["rateLimitTier"] as? String) ?? ""
         let plan = (oauth["subscriptionType"] as? String) ?? ""
         return (token, expires, tier, plan)
+    }
+
+    /// True when Claude Code has saved a login. Reads only the item's
+    /// attributes (no -w), so it never asks for Keychain access.
+    static func hasLogin() -> Bool {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        proc.arguments = ["find-generic-password", "-s", "Claude Code-credentials"]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch { return false }
+        proc.waitUntilExit()
+        return proc.terminationStatus == 0
     }
 
     static func fetch(completion: @escaping (Snapshot) -> Void) {
@@ -397,7 +410,9 @@ enum Style {
 enum ModelEstimator {
     /// Runs the bundled script. Calls back with nil if it fails, and never on the main queue.
     static func run(since: Date, completion: @escaping (ModelEstimate?) -> Void) {
-        guard let script = Bundle.main.url(forResource: "claude-usage-models", withExtension: nil) else {
+        // /usr/bin/python3 is only a stub until the developer tools are
+        // installed, and calling the stub pops an install dialog.
+        guard hasPython, let script = Bundle.main.url(forResource: "claude-usage-models", withExtension: nil) else {
             completion(nil)
             return
         }
@@ -425,6 +440,16 @@ enum ModelEstimator {
         }
     }
 
+    private static let hasPython: Bool = {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
+        p.arguments = ["-p"]
+        p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }()
+
     private static func parse(_ data: Data) -> ModelEstimate? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rows = json["models"] as? [[String: Any]] else { return nil }
@@ -439,38 +464,103 @@ enum ModelEstimator {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Menu bar icon: one meter for the week, with a second above it for a 5-hour
-// session limit on plans that still have one
+// Menu bar widget (redrawn 2026-11-09): a ring for the week with an inner ring
+// for the 5-hour session, then small stacked columns, label over value:
+// 5H 22% · WEEK 66%, and a RAM or DISK column only while the Mac is in trouble.
+// The rings fill with what is LEFT, so a full green ring means plenty.
 // ─────────────────────────────────────────────────────────────────────────────
 
-func meterImage(sessionUsed: Double?, weekUsed: Double?) -> NSImage {
-    let w: CGFloat = 17, h: CGFloat = 13
-    let img = NSImage(size: NSSize(width: w, height: h), flipped: false) { _ in
-        func bar(_ frame: NSRect, _ used: Double?) {
-            let barH = frame.height
-            let r = barH / 2
-            NSColor.labelColor.withAlphaComponent(0.22).setFill()
-            NSBezierPath(roundedRect: frame, xRadius: r, yRadius: r).fill()
-            guard let used = used else { return }
-            let clamped = min(100, max(0, used))
-            guard clamped > 0 else { return }
-            // Keep a sliver visible so "barely used" still reads as a filled meter.
-            let fw = max(barH, frame.width * CGFloat(clamped) / 100)
-            Style.tint(forUsed: clamped).setFill()
-            NSBezierPath(roundedRect: NSRect(x: frame.minX, y: frame.minY, width: fw, height: barH),
-                         xRadius: r, yRadius: r).fill()
+struct BarReading {
+    var sessionUsed: Double?
+    var weekUsed: Double?
+    var offline = false
+    var mac: (label: String, value: String, level: HealthLevel)?
+}
+
+extension BarReading {
+    /// The worst non-ok health detail as a short column, or nil when fine.
+    static func macColumn(_ h: HealthAssessment?) -> (label: String, value: String, level: HealthLevel)? {
+        guard let h = h, h.level != .ok,
+              let top = h.details.filter({ $0.level != .ok }).max(by: { $0.level < $1.level }) else { return nil }
+        let s = h.sample
+        switch top.metric {
+        case .memory: return ("RAM", s.memFreePct.map { "\($0)%" } ?? "!", top.level)
+        case .disk:   return ("DISK", s.disk.map { "\($0.freeBytes / 1_000_000_000)G" } ?? "!", top.level)
+        case .load:   return ("CPU", s.loadPerCore.map { String(format: "%.1f", $0) } ?? "!", top.level)
+        default:      return ("MAC", "!", top.level)
         }
-        if let sessionUsed = sessionUsed {
-            let barH: CGFloat = 4.5, gap: CGFloat = 2.5
-            bar(NSRect(x: 0, y: h / 2 + gap / 2 - 1, width: w, height: barH), sessionUsed)
-            bar(NSRect(x: 0, y: h / 2 - gap / 2 - barH - 1, width: w, height: barH), weekUsed)
+    }
+}
+
+func statusImage(_ r: BarReading) -> NSImage {
+    let h: CGFloat = max(18, NSStatusBar.system.thickness - 2)
+    let labelFont = NSFont.systemFont(ofSize: 7, weight: .heavy)
+    let valueFont = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold)
+
+    typealias Col = (label: String, value: String, tint: NSColor?)
+    var cols: [Col] = []
+    if r.offline {
+        cols = [("CLAUDE", "\u{2013}\u{2013}", nil)]
+    } else if let w = r.weekUsed {
+        if let s = r.sessionUsed {
+            cols.append(("5H", String(format: "%.0f%%", max(0, 100 - s)), s >= 80 ? Style.tint(forUsed: s) : nil))
+        }
+        cols.append(("WEEK", String(format: "%.0f%%", max(0, 100 - w)), w >= 80 ? Style.tint(forUsed: w) : nil))
+    } else {
+        cols = [("CLAUDE", "\u{2026}", nil)]
+    }
+    if let m = r.mac { cols.append((m.label, m.value, Style.tint(forHealth: m.level))) }
+
+    func width(_ s: String, _ f: NSFont, kern: CGFloat = 0) -> CGFloat {
+        ceil(NSAttributedString(string: s, attributes: [.font: f, .kern: kern]).size().width)
+    }
+    let widths = cols.map { max(width($0.label, labelFont, kern: 0.6), width($0.value, valueFont)) }
+    let ring: CGFloat = 16, afterRing: CGFloat = 5, colGap: CGFloat = 7
+    let total = ring + afterRing + widths.reduce(0, +) + colGap * CGFloat(max(0, cols.count - 1))
+
+    let img = NSImage(size: NSSize(width: total, height: h), flipped: false) { _ in
+        // Rings
+        let c = NSPoint(x: ring / 2, y: h / 2)
+        func arc(radius: CGFloat, line: CGFloat, used: Double?) {
+            let track = NSBezierPath()
+            track.appendArc(withCenter: c, radius: radius, startAngle: 0, endAngle: 360)
+            track.lineWidth = line
+            NSColor.labelColor.withAlphaComponent(0.2).setStroke()
+            track.stroke()
+            guard let used = used else { return }
+            let left = min(100, max(0, 100 - used))
+            guard left > 0 else { return }
+            let p = NSBezierPath()
+            p.appendArc(withCenter: c, radius: radius, startAngle: 90, endAngle: 90 - 360 * CGFloat(left) / 100, clockwise: true)
+            p.lineWidth = line
+            p.lineCapStyle = .round
+            Style.tint(forUsed: used).setStroke()
+            p.stroke()
+        }
+        if r.sessionUsed != nil && !r.offline {
+            arc(radius: 6.9, line: 2.2, used: r.weekUsed)
+            arc(radius: 3.3, line: 2.2, used: r.sessionUsed)
         } else {
-            let barH: CGFloat = 6
-            bar(NSRect(x: 0, y: (h - barH) / 2, width: w, height: barH), weekUsed)
+            arc(radius: 6.6, line: 2.8, used: r.offline ? nil : r.weekUsed)
+        }
+
+        // Columns: label on top, value below, both left-aligned.
+        var x = ring + afterRing
+        let valueY = (h - 20) / 2 - 1.5
+        for (i, col) in cols.enumerated() {
+            NSAttributedString(string: col.label, attributes: [
+                .font: labelFont, .kern: 0.6,
+                .foregroundColor: (col.tint ?? NSColor.labelColor).withAlphaComponent(col.tint == nil ? 0.55 : 0.9),
+            ]).draw(at: NSPoint(x: x, y: valueY + 12.2))
+            NSAttributedString(string: col.value, attributes: [
+                .font: valueFont, .foregroundColor: col.tint ?? NSColor.labelColor,
+            ]).draw(at: NSPoint(x: x, y: valueY))
+            x += widths[i] + colGap
         }
         return true
     }
     img.isTemplate = false
+    img.cacheMode = .never     // re-resolve label colours when the menu bar flips light/dark
     return img
 }
 
@@ -479,8 +569,8 @@ func meterImage(sessionUsed: Double?, weekUsed: Double?) -> NSImage {
 // ─────────────────────────────────────────────────────────────────────────────
 
 final class PanelView: NSView {
-    static let width: CGFloat = 296
-    private let pad: CGFloat = 15
+    static let width: CGFloat = 312
+    private let pad: CGFloat = 14
     private let rowH: CGFloat = 47
 
     var snapshot = Snapshot() { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
@@ -585,40 +675,83 @@ final class PanelView: NSView {
 
     private var healthRowCount: Int { health.map { healthRows($0).count } ?? 0 }
 
-    override var intrinsicContentSize: NSSize {
-        var h = pad + 20 + 8                       // header
-        h += CGFloat(rowCount) * rowH
+    // Cards: the Claude and Mac sections each sit on a soft rounded plate.
+    private let headerH: CGFloat = 32
+    private let inset: CGFloat = 10          // card edge to row text
+    private let cardTop: CGFloat = 8
+    private let cardTitleH: CGFloat = 20
+    private let cardBottom: CGFloat = 6
+    private let cardGap: CGFloat = 10
+
+    private var claudeCardH: CGFloat {
+        var h = cardTop + cardTitleH + CGFloat(rowCount) * rowH
         if !snapshot.products.isEmpty { h += productH }
         if !modelRows.isEmpty { h += modelHeaderH + CGFloat(modelRows.count) * modelRowH + modelNoteH }
+        if rowCount == 0 && snapshot.error == nil { h += 30 }
+        return h + cardBottom
+    }
+    private var macCardH: CGFloat { cardTop + cardTitleH + CGFloat(healthRowCount) * healthRowH + cardBottom }
+
+    override var intrinsicContentSize: NSSize {
+        var h = pad + headerH
         if snapshot.error != nil { h += 38 }
-        if rowCount == 0 && snapshot.error == nil { h += 34 }
-        if health != nil { h += healthHeaderH + CGFloat(healthRowCount) * healthRowH + freeRowH }
+        h += claudeCardH
+        if health != nil { h += cardGap + macCardH + freeRowH }
         h += 24 + pad                              // footer
         return NSSize(width: PanelView.width, height: h)
+    }
+
+    private func card(_ rect: NSRect) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10)
+        NSColor.labelColor.withAlphaComponent(0.045).setFill()
+        path.fill()
+        NSColor.labelColor.withAlphaComponent(0.07).setStroke()
+        path.lineWidth = 0.5
+        path.stroke()
+    }
+
+    private func sectionTitle(_ title: String, symbol: String, right: String? = nil, rightColor: NSColor = .tertiaryLabelColor,
+                              y: CGFloat, x: CGFloat, width: CGFloat) {
+        var tx = x
+        if let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold)) {
+            let tinted = NSImage(size: img.size, flipped: false) { r in
+                img.draw(in: r); NSColor.secondaryLabelColor.set(); r.fill(using: .sourceAtop); return true
+            }
+            tinted.draw(in: NSRect(x: x, y: y + 4, width: img.size.width, height: img.size.height))
+            tx += img.size.width + 5
+        }
+        draw(title, font: .systemFont(ofSize: 10, weight: .bold), color: .secondaryLabelColor, kern: 0.9,
+             in: NSRect(x: tx, y: y + 3, width: width - (tx - x), height: 15))
+        if let right = right {
+            draw(right, font: .systemFont(ofSize: 10, weight: .semibold), color: rightColor, align: .right,
+                 in: NSRect(x: x, y: y + 3, width: width, height: 15))
+        }
     }
 
     override func draw(_ dirtyRect: NSRect) {
         let W = bounds.width
         var y = bounds.height - pad
 
-        // Header
-        y -= 15
+        // Header: icon, name, plan pill.
+        y -= 24
         var nameX = pad
         if let icon = PanelView.appIcon {
-            icon.draw(in: NSRect(x: pad - 1, y: y - 1, width: 16, height: 16))
-            nameX += 20
+            icon.draw(in: NSRect(x: pad - 2, y: y - 1, width: 26, height: 26))
+            nameX += 28
         }
-        draw("HEADROOM",
-             font: .systemFont(ofSize: 10.5, weight: .bold),
-             color: .secondaryLabelColor, kern: 1.0,
-             in: NSRect(x: nameX, y: y, width: W - pad - nameX, height: 15))
+        draw("Headroom", font: .systemFont(ofSize: 15, weight: .bold), color: .labelColor,
+             in: NSRect(x: nameX, y: y + 2, width: 140, height: 20))
         if !snapshot.plan.isEmpty {
-            draw(snapshot.plan,
-                 font: .systemFont(ofSize: 10, weight: .semibold),
-                 color: .tertiaryLabelColor, align: .right,
-                 in: NSRect(x: pad, y: y, width: W - pad * 2, height: 15))
+            let font = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
+            let tw = ceil(NSAttributedString(string: snapshot.plan, attributes: [.font: font]).size().width)
+            let pill = NSRect(x: W - pad - tw - 16, y: y + 3, width: tw + 16, height: 18)
+            NSColor.controlAccentColor.withAlphaComponent(0.16).setFill()
+            NSBezierPath(roundedRect: pill, xRadius: 9, yRadius: 9).fill()
+            draw(snapshot.plan, font: font, color: .controlAccentColor, align: .center,
+                 in: NSRect(x: pill.minX, y: pill.minY + 2, width: pill.width, height: 14))
         }
-        y -= 13
+        y -= headerH - 24
 
         // Error banner
         if let err = snapshot.error {
@@ -627,19 +760,23 @@ final class PanelView: NSView {
             // Red means "no numbers"; amber means "numbers shown, but stale".
             let tint: NSColor = snapshot.stale ? .systemOrange : .systemRed
             tint.withAlphaComponent(0.10).setFill()
-            NSBezierPath(roundedRect: box, xRadius: 6, yRadius: 6).fill()
+            NSBezierPath(roundedRect: box, xRadius: 8, yRadius: 8).fill()
             draw(err, font: .systemFont(ofSize: 11), color: tint, lines: 2,
                  in: box.insetBy(dx: 9, dy: 5))
             y -= 4
         }
 
-        // Gauge rows
+        // Claude card
+        let cx = pad + inset, cw = W - pad * 2 - inset * 2
+        card(NSRect(x: pad, y: y - claudeCardH, width: W - pad * 2, height: claudeCardH))
+        y -= cardTop + cardTitleH
+        sectionTitle("CLAUDE", symbol: "sparkle", y: y, x: cx, width: cw)
+
         for g in snapshot.gauges {
             y -= rowH
-            drawGaugeRow(g, in: NSRect(x: pad, y: y, width: W - pad * 2, height: rowH))
+            drawGaugeRow(g, in: NSRect(x: cx, y: y, width: cw, height: rowH))
         }
 
-        // Extra usage credits
         if let e = snapshot.extra, e.enabled {
             y -= rowH
             let div = pow(10.0, Double(e.exponent))
@@ -651,62 +788,60 @@ final class PanelView: NSView {
                          percentUsed: e.percentUsed,
                          tint: .systemPurple,
                          active: false,
-                         in: NSRect(x: pad, y: y, width: W - pad * 2, height: rowH))
+                         in: NSRect(x: cx, y: y, width: cw, height: rowH))
         }
 
         if rowCount == 0 && snapshot.error == nil {
             y -= 30
             draw("Fetching\u{2026}", font: .systemFont(ofSize: 12), color: .secondaryLabelColor,
-                 in: NSRect(x: pad, y: y, width: W - pad * 2, height: 20))
+                 in: NSRect(x: cx, y: y, width: cw, height: 20))
         }
 
-        // Where this week's usage came from
         if !snapshot.products.isEmpty {
             y -= productH
             let text = snapshot.products
                 .map { String(format: "%@ %.0f%%", $0.name, $0.percent) }
                 .joined(separator: " \u{00B7} ")
             draw("This week: " + text, font: .systemFont(ofSize: 10.5), color: .secondaryLabelColor,
-                 in: NSRect(x: pad + 12, y: y + 3, width: W - pad * 2 - 12, height: 14))
+                 in: NSRect(x: cx + 12, y: y + 3, width: cw - 12, height: 14))
         }
 
-        // Estimated split by model
         if !modelRows.isEmpty, let e = estimate {
             y -= modelHeaderH
-            draw("WEEK BY MODEL", font: .systemFont(ofSize: 10, weight: .semibold),
-                 color: .secondaryLabelColor, kern: 0.9,
-                 in: NSRect(x: pad, y: y + 4, width: W - pad * 2, height: 15))
-            draw("estimate", font: .systemFont(ofSize: 10, weight: .semibold),
+            draw("WEEK BY MODEL", font: .systemFont(ofSize: 9.5, weight: .semibold),
+                 color: .tertiaryLabelColor, kern: 0.9,
+                 in: NSRect(x: cx + 12, y: y + 4, width: cw - 12, height: 15))
+            draw("estimate", font: .systemFont(ofSize: 9.5, weight: .semibold),
                  color: .tertiaryLabelColor, align: .right,
-                 in: NSRect(x: pad, y: y + 4, width: W - pad * 2, height: 15))
+                 in: NSRect(x: cx, y: y + 4, width: cw, height: 15))
             for m in modelRows {
                 y -= modelRowH
-                drawModelRow(m, in: NSRect(x: pad, y: y, width: W - pad * 2, height: modelRowH))
+                drawModelRow(m, in: NSRect(x: cx, y: y, width: cw, height: modelRowH))
             }
             y -= modelNoteH
             var note = "Share of Claude Code tokens, weighted by API price. From "
                 + e.hosts.joined(separator: " + ") + "."
             if !e.unreachable.isEmpty { note += " " + e.unreachable.joined(separator: ", ") + " not reachable." }
             draw(note, font: .systemFont(ofSize: 10), color: .tertiaryLabelColor, lines: 2,
-                 in: NSRect(x: pad + 12, y: y + 2, width: W - pad * 2 - 12, height: 28))
+                 in: NSRect(x: cx + 12, y: y + 2, width: cw - 12, height: 28))
         }
+        y -= cardBottom
 
-        // Mac health
+        // Mac card
         if let h = health {
-            y -= healthHeaderH
-            draw("MAC", font: .systemFont(ofSize: 10, weight: .semibold),
-                 color: .secondaryLabelColor, kern: 0.9,
-                 in: NSRect(x: pad, y: y + 4, width: W - pad * 2, height: 15))
-            if h.level != .ok, let top = h.reasons.first {
-                draw(top, font: .systemFont(ofSize: 10, weight: .semibold),
-                     color: Style.tint(forHealth: h.level), align: .right,
-                     in: NSRect(x: pad, y: y + 4, width: W - pad * 2, height: 15))
-            }
+            y -= cardGap
+            card(NSRect(x: pad, y: y - macCardH, width: W - pad * 2, height: macCardH))
+            y -= cardTop + cardTitleH
+            sectionTitle("MAC", symbol: "laptopcomputer",
+                         right: h.level != .ok ? h.reasons.first : "running smoothly",
+                         rightColor: h.level != .ok ? Style.tint(forHealth: h.level) : .tertiaryLabelColor,
+                         y: y, x: cx, width: cw)
             for row in healthRows(h) {
                 y -= healthRowH
-                drawKeyValueRow(row, in: NSRect(x: pad, y: y, width: W - pad * 2, height: healthRowH))
+                drawKeyValueRow(row, in: NSRect(x: cx, y: y, width: cw, height: healthRowH))
             }
-            y -= freeRowH          // the Clean Up button (a subview, see layout())
+            y -= cardBottom
+            y -= freeRowH          // the Speed Up and Disk buttons (subviews, see layout())
         }
 
         // Footer
@@ -1009,7 +1144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ note: Notification) {
         LoginItem.upgradeIfNeeded()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.imagePosition = .imageLeading
+        statusItem.button?.imagePosition = .imageOnly
         render()
 
         buildMenu()
@@ -1039,6 +1174,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.render()
         }
         healthMonitor.start()
+
+        // The setup page made a fresh usage call: show it now, not in 5 minutes.
+        NotificationCenter.default.addObserver(forName: Setup.connected, object: nil, queue: .main) { [weak self] note in
+            guard let snap = note.object as? Snapshot else { return }
+            self?.lastFetchStarted = Date()
+            self?.apply(snap)
+        }
+        // First launch (from the DMG): the setup window. Debug: --setup-window N.
+        if let i = CommandLine.arguments.firstIndex(of: "--setup-window") {
+            let page = CommandLine.arguments.count > i + 1 ? Int(CommandLine.arguments[i + 1]) ?? 0 : 0
+            if CommandLine.arguments.contains("--dark") { NSApp.appearance = NSAppearance(named: .darkAqua) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { Setup.open(page: page) }
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { Setup.showIfNeeded {} }
+        }
 
         refresh()
         // 5 min: the endpoint's limiter is shared with Claude Code's own calls,
@@ -1107,6 +1257,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(loginToggle)
 
         menu.addItem(.separator())
+        let setupItem = NSMenuItem(title: "Setup & About\u{2026}", action: #selector(openSetup), keyEquivalent: ",")
+        setupItem.target = self
+        setupItem.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: nil)
+        menu.addItem(setupItem)
+        let credit = NSMenuItem(title: "Headroom \(Setup.version) \u{00B7} made by \(Setup.author)", action: nil, keyEquivalent: "")
+        credit.isEnabled = false
+        menu.addItem(credit)
         let quit = NSMenuItem(title: "Quit Headroom", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
@@ -1163,6 +1320,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func quit() { NSApp.terminate(nil) }
 
+    @objc private func openSetup() {
+        menu.cancelTracking()
+        DispatchQueue.main.async { Setup.open(page: 0) }
+    }
+
     private func refresh(force: Bool = false) {
         // The usage endpoint 429s under rapid polling; menu opens are throttled.
         // ⌘R still forces a fetch, but a backoff hold blocks even that.
@@ -1170,24 +1332,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastFetchStarted = Date()
 
         UsageFetcher.fetch { [weak self] snap in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                var snap = snap
-                // Keep the last good reading visible through a transient failure.
-                if snap.error != nil, snap.gauges.isEmpty, !self.snapshot.gauges.isEmpty {
-                    snap.gauges = self.snapshot.gauges
-                    snap.products = self.snapshot.products
-                    snap.extra = self.snapshot.extra
-                    snap.fetchedAt = self.snapshot.fetchedAt
-                    snap.stale = true
-                }
-                self.snapshot = snap
-                self.panel.snapshot = snap
-                self.panel.frame = NSRect(origin: .zero, size: self.panel.intrinsicContentSize)
-                self.render()
-                self.refreshEstimate()
-            }
+            DispatchQueue.main.async { self?.apply(snap) }
         }
+    }
+
+    private func apply(_ fresh: Snapshot) {
+        var snap = fresh
+        // Keep the last good reading visible through a transient failure.
+        if snap.error != nil, snap.gauges.isEmpty, !self.snapshot.gauges.isEmpty {
+            snap.gauges = self.snapshot.gauges
+            snap.products = self.snapshot.products
+            snap.extra = self.snapshot.extra
+            snap.fetchedAt = self.snapshot.fetchedAt
+            snap.stale = true
+        }
+        self.snapshot = snap
+        self.panel.snapshot = snap
+        self.panel.frame = NSRect(origin: .zero, size: self.panel.intrinsicContentSize)
+        self.render()
+        self.refreshEstimate()
     }
 
     /// The week starts seven days before it resets. Reading the logs costs no API
@@ -1210,40 +1373,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let button = statusItem.button else { return }
         let s = snapshot.session?.percentUsed
         let w = snapshot.weekly?.percentUsed
-        button.image = meterImage(sessionUsed: s, weekUsed: w)
+        let offline = snapshot.error != nil && snapshot.gauges.isEmpty
+        button.image = statusImage(BarReading(sessionUsed: s, weekUsed: w, offline: offline,
+                                              mac: BarReading.macColumn(health)))
+        button.title = ""
+        button.imagePosition = .imageOnly
 
-        let text: String
-        var color = NSColor.labelColor
-        if snapshot.error != nil && snapshot.gauges.isEmpty {
-            text = " \u{2013}\u{2013}"
-            color = .tertiaryLabelColor
-        } else if let w = w {
-            // A 5-hour limit only comes back for plans and accounts that have one.
-            if let s = s {
-                text = String(format: " %.0f%% \u{00B7} %.0f%%", max(0, 100 - s), max(0, 100 - w))
-            } else {
-                text = String(format: " %.0f%%", max(0, 100 - w))
-            }
-            let worst = max(s ?? 0, w)
-            if worst >= 80 { color = Style.tint(forUsed: worst) }
-        } else {
-            text = " \u{2026}"
-            color = .tertiaryLabelColor
-        }
-
-        let title = NSMutableAttributedString(string: text, attributes: [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium),
-            .foregroundColor: color,
-        ])
-        var tip = snapshot.error ?? (s == nil ? "Claude usage left this week"
-                                              : "Claude usage left: session \u{00B7} week")
-        // Mac health: a coloured dot in front of the text, only when not ok.
-        if let h = health, h.level != .ok {
-            title.insert(healthDot(h.level), at: 0)
-            if let top = h.reasons.first { tip += "\nMac: \(top)" }
-        }
-        button.attributedTitle = title
+        var tip = snapshot.error ?? (s == nil
+            ? String(format: "Claude left this week: %.0f%%", max(0, 100 - (w ?? 100)))
+            : String(format: "Claude left: %.0f%% of the session, %.0f%% of the week", max(0, 100 - s!), max(0, 100 - (w ?? 100))))
+        if let h = health, h.level != .ok, let top = h.reasons.first { tip += "\nMac: \(top)" }
         button.toolTip = tip
+        button.setAccessibilityLabel("Headroom. " + tip)
     }
 }
 
@@ -1330,32 +1471,33 @@ if CommandLine.arguments.contains("--notify-test") {
 }
 
 // Debug: render the menu bar item to a PNG and exit.
+if let i = CommandLine.arguments.firstIndex(of: "--mascot"),
+   CommandLine.arguments.count > i + 1 {
+    NSApplication.shared.setActivationPolicy(.prohibited)
+    let mood: Mascot.Mood = CommandLine.arguments.contains("--sluggish") ? .sluggish : .fast
+    renderPNG(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]), size: Mascot.canvas, scale: 2, dark: false) { r in
+        Mascot.draw(mood, in: r)
+    }
+    exit(0)
+}
+
 if let i = CommandLine.arguments.firstIndex(of: "--icon"),
    CommandLine.arguments.count > i + 1 {
     let out = URL(fileURLWithPath: CommandLine.arguments[i + 1])
     let dark = CommandLine.arguments.contains("--dark")
     NSApplication.shared.setActivationPolicy(.prohibited)
     let sessionUsed: Double? = CommandLine.arguments.contains("--session") ? 78 : nil
-    let weekUsed = 34.0
-    renderPNG(to: out, size: NSSize(width: 104, height: 24), scale: 4, dark: dark) { rect in
+    var mac: (label: String, value: String, level: HealthLevel)?
+    if let h = CommandLine.arguments.firstIndex(of: "--health"), CommandLine.arguments.count > h + 1 {
+        mac = CommandLine.arguments[h + 1] == "critical" ? ("RAM", "9%", .critical) : ("RAM", "24%", .warn)
+    }
+    let img = statusImage(BarReading(sessionUsed: sessionUsed, weekUsed: 34, mac: mac))
+    let size = NSSize(width: img.size.width + 24, height: 24)
+    renderPNG(to: out, size: size, scale: 4, dark: dark) { rect in
         (dark ? NSColor(white: 0.17, alpha: 1) : NSColor(white: 0.94, alpha: 1)).setFill()
         rect.fill()
-        let icon = meterImage(sessionUsed: sessionUsed, weekUsed: weekUsed)
-        let x: CGFloat = 12
-        icon.draw(at: NSPoint(x: x, y: (rect.height - icon.size.height) / 2),
-                  from: .zero, operation: .sourceOver, fraction: 1)
-        let label = sessionUsed.map { String(format: " %.0f%% \u{00B7} %.0f%%", 100 - $0, 100 - weekUsed) }
-            ?? String(format: " %.0f%%", 100 - weekUsed)
-        let title = NSMutableAttributedString(string: label, attributes: [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium),
-            .foregroundColor: NSColor.labelColor,
-        ])
-        // `--health warn|critical` previews the Mac health dot.
-        if let h = CommandLine.arguments.firstIndex(of: "--health"), CommandLine.arguments.count > h + 1 {
-            let level: HealthLevel = CommandLine.arguments[h + 1] == "critical" ? .critical : .warn
-            title.insert(healthDot(level), at: 0)
-        }
-        title.draw(at: NSPoint(x: x + icon.size.width, y: (rect.height - 14) / 2))
+        img.draw(at: NSPoint(x: 12, y: (rect.height - img.size.height) / 2),
+                 from: .zero, operation: .sourceOver, fraction: 1)
     }
     print("wrote \(out.path)")
     exit(0)
@@ -1456,18 +1598,26 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
         view.draw(rect)
         // The buttons are subviews; draw() alone leaves them out.
         view.layout()
-        for btn in [view.freeButton, view.diskButton, view.refreshButton] where !btn.isHidden {
-            guard let rep = btn.bitmapImageRepForCachingDisplay(in: btn.bounds) else { continue }
-            btn.cacheDisplay(in: btn.bounds, to: rep)
-            rep.draw(in: btn.frame)
+        // Offscreen caching paints controls on an opaque white plate, so draw
+        // look-alikes: a filled capsule for the bezel buttons, text for Refresh.
+        for btn in [view.freeButton, view.diskButton] where !btn.isHidden {
+            let f = btn.frame.insetBy(dx: 0, dy: 2)
+            (btn.bezelColor ?? NSColor.labelColor.withAlphaComponent(0.12)).setFill()
+            NSBezierPath(roundedRect: f, xRadius: f.height / 2, yRadius: f.height / 2).fill()
+            let p = NSMutableParagraphStyle(); p.alignment = .center
+            NSAttributedString(string: btn.title, attributes: [
+                .font: btn.font ?? .systemFont(ofSize: 13), .paragraphStyle: p,
+                .foregroundColor: btn.bezelColor == nil ? NSColor.labelColor : NSColor.white,
+            ]).draw(in: NSRect(x: f.minX, y: f.midY - 9, width: f.width, height: 18))
         }
+        view.refreshButton.attributedTitle.draw(in: view.refreshButton.frame)
     }
     print("wrote \(out.path)  \(Int(view.bounds.width))x\(Int(view.bounds.height))")
     exit(0)
 }
 
 // One menu bar icon only: launch-at-login plus a manual open must not double up.
-if let me = Bundle.main.bundleIdentifier {
+if let me = Bundle.main.bundleIdentifier, !CommandLine.arguments.contains("--setup-window") {
     let others = NSRunningApplication.runningApplications(withBundleIdentifier: me)
         .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
     if !others.isEmpty { exit(0) }
