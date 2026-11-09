@@ -51,7 +51,7 @@ cd claude-usage-widget
 ./build.sh
 ```
 
-That compiles `~/Applications/Claude Usage.app`, ad-hoc signs it, and launches
+That compiles `~/Applications/Headroom.app`, ad-hoc signs it, and launches
 it. Because you built it locally there is no Gatekeeper quarantine and no
 "unidentified developer" dialog.
 
@@ -158,7 +158,7 @@ alongside. The bytes are what those processes had resident when sampled, and
 the widget says so ("2.1 GB was resident"), because macOS decides what comes
 back and when.
 
-Reaping runs on every poll that finds a stale target (when **Auto-reap Leaks**
+Reaping runs on every poll that finds a stale target (when **Clear Leaks Automatically**
 is on, the default), immediately on a memory-pressure event, and on **Reap
 Leaks Now** (⌘K) regardless of the toggle.
 
@@ -216,26 +216,9 @@ the last check found nothing. The last reap is also persisted
 
 ### Menu items
 
-- **Speed Up…** (⌘U): one dialog listing what can be done right now, as
-  checkboxes. Nothing runs until you press **Speed Up**.
-  - *Leaks* the reaper already knows about (ticked).
-  - *Heavy jobs*: Xcode builds and tests (`xcodebuild`), booted iOS
-    simulators and `ffmpeg` renders, each with its age, process count and
-    CPU (never ticked: they belong to someone's work). A job is signalled
-    (`SIGTERM`) only if the same pid still runs the same full command line;
-    a simulator goes through `xcrun simctl shutdown`.
-  - *Rebuildable caches* with their sizes, from a fixed list (uv, Codex,
-    Playwright, Adobe Camera Raw, pip). Ticked only while the disk is low.
-    uv is cleared with `uv cache clean`. Nothing outside that list is
-    ever deleted; Xcode DeviceSupport and DerivedData are left out on purpose.
-  Every action is logged to `~/.claude-mem/hygiene.log` as `widget: speed-up: …`,
-  and a notification sums up what was done.
-- **Reap Leaks Now** (⌘K): sample and reap, toggle or not.
-- **Auto-reap Leaks**: the `health.autoReap` toggle.
-- **Suspected Leaks…**: enabled only while there are targets; lists each one
-  (pid, age, resident MB, owner) with a **Terminate** button that runs a
-  manual reap, and **Cancel**.
-- **Open Activity Monitor**: for when you want to see the rest.
+- **Clean Up Mac…** (⌘U): see [Clean Up](#clean-up).
+- **Clear Leaks Automatically**: the `health.autoReap` toggle.
+- **Open at Login**, **Quit Headroom**.
 
 ### Staying up
 
@@ -256,17 +239,18 @@ defaults write com.claudeusage.widget health.summarizerMaxAgeMin -int 120
 defaults write com.claudeusage.widget health.emergencySummarizerAgeMin -int 10
 defaults write com.claudeusage.widget health.chromeMaxAgeMin -int 60
 defaults write com.claudeusage.widget health.pollSeconds -int 30
+defaults write com.claudeusage.widget health.summarizerBurstMax -int 10   # burst rule; 0 = off
 ```
 
 ### Debug flags
 
 ```sh
-"$HOME/Applications/Claude Usage.app/Contents/MacOS/ClaudeUsage" --health-json     # one sample + assessment as JSON, timing on stderr
-"$HOME/Applications/Claude Usage.app/Contents/MacOS/ClaudeUsage" --reap-dry-run   # what a reap would kill, without killing
-"$HOME/Applications/Claude Usage.app/Contents/MacOS/ClaudeUsage" --notify-test    # one test notification through the reaper's path
-"$HOME/Applications/Claude Usage.app/Contents/MacOS/ClaudeUsage" --argv-selftest  # KERN_PROCARGS2 parser + fingerprint fixtures; non-zero exit on any failure
-"$HOME/Applications/Claude Usage.app/Contents/MacOS/ClaudeUsage" --speedup-dry-run                 # what Speed Up would offer now, cache sizes included
-"$HOME/Applications/Claude Usage.app/Contents/MacOS/ClaudeUsage" --speedup-snapshot out.png         # the dialog with synthetic rows, as a PNG (light only)
+"$HOME/Applications/Headroom.app/Contents/MacOS/Headroom" --health-json     # one sample + assessment as JSON, timing on stderr
+"$HOME/Applications/Headroom.app/Contents/MacOS/Headroom" --reap-dry-run   # what a reap would kill, without killing
+"$HOME/Applications/Headroom.app/Contents/MacOS/Headroom" --notify-test    # one test notification through the reaper's path
+"$HOME/Applications/Headroom.app/Contents/MacOS/Headroom" --argv-selftest  # KERN_PROCARGS2 parser + fingerprint fixtures; non-zero exit on any failure
+"$HOME/Applications/Headroom.app/Contents/MacOS/Headroom" --relief-dry-run         # what Clean Up would list now, cache sizes included
+"$HOME/Applications/Headroom.app/Contents/MacOS/Headroom" --relief-snapshot out.png  # the window with synthetic rows, as a PNG (light only)
 ```
 
 `--health-json` reports `level` after the hysteresis (it assesses the sample
@@ -278,26 +262,33 @@ missing terminator, argc larger than the payload, empty argument, bad UTF-8)
 and the option scanner against `--` handling; the parser is a kill gate, so it
 fails closed on anything it cannot read.
 
-## Free Up Memory
+## Clean Up
 
-The button under the MAC rows (also the menu, ⌘M) turns orange when memory is
-under 35% free and red under 15%. One click clears the leaks the reaper already
-owns, at any age while memory is low, then opens a window:
+The menu has one action, **Clean Up Mac…** (⌘U), which is also the big button
+under the MAC rows. The button turns orange or red and names the problem when
+memory, load or disk is in trouble. One click clears the leaks the reaper
+already owns (at any age while memory is low), then opens one window:
 
-- **Before → Now**: memory free, swap and compressed, measured again after
-  every action and on Recheck.
-- **Claude Code sessions** with their MCP servers, by physical footprint, with
-  folder, age, keyboard idle time and tmux session. Detached or 3 h idle
-  sessions are marked suggested. Close kills the tmux pane, or sends SIGTERM.
-- **Simulators** (Shut Down), **apps** over 300 MB (Quit, so they can ask to
-  save; a terminal hosting sessions says so), **background processes** over
-  800 MB started by launchd (Stop). Apps and background processes are never
-  suggested.
+- **Memory before → now** in large numbers, plus disk free and load, measured
+  again after every action and on Recheck.
+- Five sections, each with one sentence on when it matters:
+  **Claude Code sessions** (folder, age, keyboard idle time, tmux session;
+  detached or 3 h idle are suggested; Close kills the tmux pane, or SIGTERM),
+  **heavy jobs** (Xcode builds and tests, ffmpeg, booted simulators; busy ones
+  suggested), **apps** over 300 MB (Quit, so they can ask to save),
+  **background processes** over 800 MB started by launchd (never suggested),
+  and **disk space** (a fixed list of rebuildable caches, suggested while the
+  disk is under 50 GB free; sizes arrive after a few seconds).
+- **Clean Up N Suggested** acts on the suggested rows only. Nothing else runs
+  without a click on its row. A second click on a survivor forces it.
 
-A second click on a row that survived escalates to SIGKILL / force quit. Every
-signal re-checks pid and start time first and is logged to
-`~/.claude-mem/hygiene.log`. Debug: `--relief-dry-run`, `--relief-snapshot
-out.png`, `--relief-window` (opens the live window at launch).
+Every signal re-checks pid and start time (jobs: the full command line) and is
+logged to `~/.claude-mem/hygiene.log`. The rest of the menu: **Clear Leaks
+Automatically** (the 30-second reaper, with the burst rule), Open at Login,
+Quit. Refresh is the button in the panel footer (⌘R still works).
+
+Debug: `--relief-dry-run`, `--relief-snapshot out.png`, `--relief-window
+[--dark]`. The icon is drawn by `swift tools/make-icon.swift`.
 
 ## Rate limiting
 
@@ -351,7 +342,7 @@ statusline.
 
 ```sh
 ./build.sh                                     # compile, sign, relaunch
-"$HOME/Applications/Claude Usage.app/Contents/MacOS/ClaudeUsage" \
+"$HOME/Applications/Headroom.app/Contents/MacOS/Headroom" \
     --snapshot out.png [--demo [--stale]] [--dark]  # render the dropdown panel
     --icon out.png [--dark] [--health warn|critical]  # render the menu bar item
 ```

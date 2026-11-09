@@ -41,6 +41,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>Headroom</string>
   <key>CFBundleDisplayName</key><string>Headroom</string>
   <key>CFBundleExecutable</key><string>Headroom</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleIdentifier</key><string>com.claudeusage.widget</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
@@ -53,6 +54,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 
 cp "$DIR/bin/claude-usage-models" "$RES/claude-usage-models"
+cp "$DIR/Resources/AppIcon.icns" "$RES/AppIcon.icns"    # redraw with: swift tools/make-icon.swift
 
 echo "→ signing (ad-hoc)"
 codesign --force --deep --sign - "$APP"

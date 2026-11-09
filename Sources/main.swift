@@ -491,33 +491,53 @@ final class PanelView: NSView {
     var healthState = HealthPanelState() { didSet { invalidateIntrinsicContentSize(); needsDisplay = true; styleFreeButton() } }
     private var health: HealthAssessment? { healthState.assessment }
 
-    // Free Up Memory: a real button under the MAC rows (menu item views pass
-    // clicks to their controls). Red while memory is critical, orange on warn.
-    private let freeRowH: CGFloat = 40
-    let freeButton = NSButton(title: "Free Up Memory", target: nil, action: nil)
+    // Clean Up: a real button under the MAC rows (menu item views pass clicks
+    // to their controls). Tinted by the Mac's state: red critical, orange warn.
+    private let freeRowH: CGFloat = 42
+    let freeButton = NSButton(title: "Clean Up Mac", target: nil, action: nil)
     var onFreeMemory: (() -> Void)?
+    // Refresh lives in the footer, next to the time it changes.
+    let refreshButton = NSButton(title: "Refresh", target: nil, action: nil)
+    var onRefresh: (() -> Void)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         freeButton.bezelStyle = .rounded
-        freeButton.controlSize = .regular
+        freeButton.controlSize = .large
+        freeButton.font = .systemFont(ofSize: 13, weight: .semibold)
         freeButton.target = self
         freeButton.action = #selector(freeClicked)
         freeButton.isHidden = true
+        freeButton.toolTip = "Clears leaked background processes now, then shows what else is slowing the Mac."
         addSubview(freeButton)
+
+        refreshButton.isBordered = false
+        refreshButton.font = .systemFont(ofSize: 10.5, weight: .medium)
+        refreshButton.contentTintColor = .secondaryLabelColor
+        refreshButton.alignment = .right
+        let rp = NSMutableParagraphStyle(); rp.alignment = .right
+        refreshButton.attributedTitle = NSAttributedString(string: "Refresh", attributes: [
+            .font: NSFont.systemFont(ofSize: 10.5, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: rp])
+        refreshButton.target = self
+        refreshButton.action = #selector(refreshClicked)
+        refreshButton.toolTip = "Ask Claude for fresh usage numbers (they also update every 5 minutes). \u{2318}R"
+        addSubview(refreshButton)
     }
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    @objc private func freeClicked() { onFreeMemory?() }
+    /// The app icon from the bundle (nil for a bare debug binary).
+    static let appIcon: NSImage? = Bundle.main.image(forResource: "AppIcon")
 
-    private var memoryLevel: HealthLevel { health?.level(for: .memory) ?? .ok }
+    @objc private func freeClicked() { onFreeMemory?() }
+    @objc private func refreshClicked() { onRefresh?() }
 
     private func styleFreeButton() {
         freeButton.isHidden = health == nil
-        let lvl = memoryLevel
-        let pct = health?.sample.memFreePct
-        freeButton.title = lvl == .ok ? "Free Up Memory"
-            : "Free Up Memory" + (pct.map { " \u{00B7} \($0)% free" } ?? "")
+        let lvl = health?.level ?? .ok
+        var title = "Clean Up Mac"
+        if lvl != .ok, let top = health?.reasons.first { title += "  \u{00B7}  " + top }
+        freeButton.title = title
         freeButton.bezelColor = lvl == .critical ? .systemRed : lvl == .warn ? .systemOrange : nil
         needsLayout = true
     }
@@ -525,7 +545,8 @@ final class PanelView: NSView {
     override func layout() {
         super.layout()
         // The row sits right above the footer, which is where the MAC section ends.
-        freeButton.frame = NSRect(x: pad, y: pad + 24 + 6, width: bounds.width - pad * 2, height: 28)
+        freeButton.frame = NSRect(x: pad, y: pad + 24 + 6, width: bounds.width - pad * 2, height: 32)
+        refreshButton.frame = NSRect(x: bounds.width - pad - 80, y: pad + 3, width: 80, height: 16)
     }
 
     // Rows under the gauges: where usage came from, and the split by model.
@@ -562,10 +583,15 @@ final class PanelView: NSView {
 
         // Header
         y -= 15
+        var nameX = pad
+        if let icon = PanelView.appIcon {
+            icon.draw(in: NSRect(x: pad - 1, y: y - 1, width: 16, height: 16))
+            nameX += 20
+        }
         draw("HEADROOM",
-             font: .systemFont(ofSize: 10, weight: .semibold),
-             color: .secondaryLabelColor, kern: 0.9,
-             in: NSRect(x: pad, y: y, width: W - pad * 2, height: 15))
+             font: .systemFont(ofSize: 10.5, weight: .bold),
+             color: .secondaryLabelColor, kern: 1.0,
+             in: NSRect(x: nameX, y: y, width: W - pad - nameX, height: 15))
         if !snapshot.plan.isEmpty {
             draw(snapshot.plan,
                  font: .systemFont(ofSize: 10, weight: .semibold),
@@ -660,7 +686,7 @@ final class PanelView: NSView {
                 y -= healthRowH
                 drawKeyValueRow(row, in: NSRect(x: pad, y: y, width: W - pad * 2, height: healthRowH))
             }
-            y -= freeRowH          // the Free Up Memory button (a subview, see layout())
+            y -= freeRowH          // the Clean Up button (a subview, see layout())
         }
 
         // Footer
@@ -670,8 +696,6 @@ final class PanelView: NSView {
         if snapshot.stale { stamp += " \u{00B7} last known good" }
         draw(stamp, font: .systemFont(ofSize: 10), color: .tertiaryLabelColor,
              in: NSRect(x: pad, y: y, width: W - pad * 2, height: 14))
-        draw("\u{2318}R to refresh", font: .systemFont(ofSize: 10), color: .tertiaryLabelColor,
-             align: .right, in: NSRect(x: pad, y: y, width: W - pad * 2, height: 14))
     }
 
     private func drawGaugeRow(_ g: Gauge, in rect: NSRect) {
@@ -791,7 +815,7 @@ final class PanelView: NSView {
                 title: "Disk",
                 value: "\(Style.bytes(d.freeBytes)) free",
                 sub: "\(usedPct)% used of \(Style.bytes(d.totalBytes))"
-                    + (h.level(for: .disk) == .ok ? "" : " \u{00B7} Speed Up can clear caches"),
+                    + (h.level(for: .disk) == .ok ? "" : " \u{00B7} Clean Up can clear caches"),
                 level: h.level(for: .disk))
         }
 
@@ -944,7 +968,7 @@ enum LoginItem {
 // App
 // ─────────────────────────────────────────────────────────────────────────────
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var statusItem: NSStatusItem!
     private let panel = PanelView()
@@ -953,7 +977,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private var snapshot = Snapshot()
     private var loginToggle: NSMenuItem!
     private var autoReapToggle: NSMenuItem!
-    private var suspectedItem: NSMenuItem!
     private var wakeObserver: NSObjectProtocol?
 
     // Mac health: its own poll timer (health.pollSeconds, default 30 s), the
@@ -971,8 +994,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         buildMenu()
         statusItem.menu = menu
         panel.onFreeMemory = { [weak self] in self?.freeMemory() }
-        // Debug: open Free Up Memory at launch (for screenshots of the live window).
+        panel.onRefresh = { [weak self] in self?.refresh(force: true) }
+        // Debug: open Clean Up at launch (for screenshots of the live window).
         if CommandLine.arguments.contains("--relief-window") {
+            if CommandLine.arguments.contains("--dark") { NSApp.appearance = NSAppearance(named: .darkAqua) }
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.freeMemory() }
         }
 
@@ -1015,37 +1040,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         menu.addItem(panelItem)
         menu.addItem(.separator())
 
-        let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refreshNow),
-                                     keyEquivalent: "r")
+        let cleanItem = NSMenuItem(title: "Clean Up Mac\u{2026}", action: #selector(freeMemory), keyEquivalent: "u")
+        cleanItem.target = self
+        cleanItem.image = NSImage(systemSymbolName: "gauge.with.dots.needle.67percent", accessibilityDescription: nil)
+        cleanItem.toolTip = "Clears leaked background processes now, then shows sessions, apps, jobs and caches you can close."
+        menu.addItem(cleanItem)
+        menu.addItem(.separator())
+
+        // ⌘R still works while the menu is open; the visible control is the
+        // Refresh button in the panel footer.
+        let refreshItem = NSMenuItem(title: "Refresh Usage", action: #selector(refreshNow), keyEquivalent: "r")
         refreshItem.target = self
+        refreshItem.isHidden = true
+        refreshItem.allowsKeyEquivalentWhenHidden = true
         menu.addItem(refreshItem)
 
-        let freeItem = NSMenuItem(title: "Free Up Memory\u{2026}", action: #selector(freeMemory), keyEquivalent: "m")
-        freeItem.target = self
-        menu.addItem(freeItem)
-
-        let speedItem = NSMenuItem(title: "Speed Up\u{2026}", action: #selector(speedUp), keyEquivalent: "u")
-        speedItem.target = self
-        menu.addItem(speedItem)
-
-        let reapItem = NSMenuItem(title: "Reap Leaks Now", action: #selector(reapNow), keyEquivalent: "k")
-        reapItem.target = self
-        menu.addItem(reapItem)
-
-        autoReapToggle = NSMenuItem(title: "Auto-reap Leaks", action: #selector(toggleAutoReap),
+        autoReapToggle = NSMenuItem(title: "Clear Leaks Automatically", action: #selector(toggleAutoReap),
                                     keyEquivalent: "")
         autoReapToggle.target = self
+        autoReapToggle.toolTip = "Every 30 seconds, closes leaked claude-mem summarizers and stray headless Chrome. Never touches your sessions or apps."
         menu.addItem(autoReapToggle)
-
-        suspectedItem = NSMenuItem(title: "Suspected Leaks\u{2026}", action: #selector(showSuspected),
-                                   keyEquivalent: "")
-        suspectedItem.target = self
-        menu.addItem(suspectedItem)
-
-        let monitorItem = NSMenuItem(title: "Open Activity Monitor", action: #selector(openActivityMonitor),
-                                     keyEquivalent: "")
-        monitorItem.target = self
-        menu.addItem(monitorItem)
 
         loginToggle = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin),
                                  keyEquivalent: "")
@@ -1067,20 +1081,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         healthMonitor.poll()
     }
 
-    /// "Suspected Leaks…" is live only while there is something to show.
-    func validateMenuItem(_ item: NSMenuItem) -> Bool {
-        item.action == #selector(showSuspected) ? !healthState.suspected.isEmpty : true
-    }
-
     private var lastFetchStarted = Date.distantPast
     private var lastEstimateStarted = Date.distantPast
 
     @objc private func refreshNow() { refresh(force: true) }
 
-    @objc private func reapNow() { healthMonitor.poll(manual: true) }
-
-    /// One click: clears the leaks at once, then opens the window that lists
-    /// what else holds memory and measures again after each close.
+    /// One click: clears the leaks at once, then opens the Clean Up window,
+    /// which lists what else slows the Mac and measures again after each close.
     @objc private func freeMemory() {
         menu.cancelTracking()
         let low = (health?.level(for: .memory) ?? .ok) != .ok
@@ -1090,42 +1097,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         }
     }
 
-    @objc private func speedUp() {
-        SpeedUp.present(suspected: healthState.suspected,
-                        assessment: health,
-                        reapLeaks: { [weak self] in self?.healthMonitor.poll(manual: true) },
-                        recheck: { [weak self] in self?.healthMonitor.poll() })
-    }
-
-    /// Lists the current targets and offers to terminate them (a manual reap,
-    /// which runs whether or not auto-reap is on).
-    @objc private func showSuspected() {
-        let list = healthState.suspected
-        guard !list.isEmpty else { return }
-        let alert = NSAlert()
-        alert.messageText = "\(list.count) suspected leak\(list.count == 1 ? "" : "s")"
-        alert.informativeText = list.map { p in
-            let kind = p.owner != nil ? "summarizer" : "headless Chrome"
-            var line = "pid \(p.pid) \u{00B7} \(kind) \u{00B7} \(Style.duration(p.age)) \u{00B7} \(Style.bytes(p.rss))"
-            if let owner = p.owner, let op = p.ownerPid { line += " \u{00B7} \(owner) (pid \(op))" }
-            return line
-        }.joined(separator: "\n")
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Terminate")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
-            healthMonitor.poll(manual: true)
-        }
-    }
-
     @objc private func toggleAutoReap() {
         HealthPrefs.autoReap.toggle()
         autoReapToggle.state = HealthPrefs.autoReap ? .on : .off
-    }
-
-    @objc private func openActivityMonitor() {
-        NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app"))
     }
 
     @objc private func toggleLogin() {
@@ -1275,33 +1249,17 @@ if CommandLine.arguments.contains("--reap-dry-run") {
     exit(0)
 }
 
-// Debug: what Speed Up would offer right now (jobs, caches with sizes), no action.
-if CommandLine.arguments.contains("--speedup-dry-run") {
-    print(SpeedUp.dryRun())
-    exit(0)
-}
-
-// Debug: render the Speed Up dialog with synthetic rows to a PNG.
-if let i = CommandLine.arguments.firstIndex(of: "--speedup-snapshot"),
-   CommandLine.arguments.count > i + 1 {
-    NSApplication.shared.setActivationPolicy(.prohibited)
-    SpeedUp.snapshot(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]),
-                     dark: CommandLine.arguments.contains("--dark"))
-    exit(0)
-}
-
-// Debug: what Free Up Memory would list right now, no action.
+// Debug: what Clean Up would list right now, no action.
 if CommandLine.arguments.contains("--relief-dry-run") {
     print(Relief.dryRun())
     exit(0)
 }
 
-// Debug: render the Free Up Memory window with synthetic rows to a PNG.
+// Debug: render the Clean Up window with synthetic rows to a PNG (light only).
 if let i = CommandLine.arguments.firstIndex(of: "--relief-snapshot"),
    CommandLine.arguments.count > i + 1 {
     NSApplication.shared.setActivationPolicy(.prohibited)
-    ReliefWindow.snapshot(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]),
-                          dark: CommandLine.arguments.contains("--dark"))
+    ReliefWindow.snapshot(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
     exit(0)
 }
 
@@ -1441,10 +1399,10 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
         (dark ? NSColor(white: 0.13, alpha: 1) : NSColor(white: 0.97, alpha: 1)).setFill()
         rect.fill()
         view.draw(rect)
-        // The Free Up Memory button is a subview; draw() alone leaves it out.
+        // The buttons are subviews; draw() alone leaves them out.
         view.layout()
-        let btn = view.freeButton
-        if !btn.isHidden, let rep = btn.bitmapImageRepForCachingDisplay(in: btn.bounds) {
+        for btn in [view.freeButton, view.refreshButton] where !btn.isHidden {
+            guard let rep = btn.bitmapImageRepForCachingDisplay(in: btn.bounds) else { continue }
             btn.cacheDisplay(in: btn.bounds, to: rep)
             rep.draw(in: btn.frame)
         }
