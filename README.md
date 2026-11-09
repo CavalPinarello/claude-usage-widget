@@ -216,7 +216,8 @@ the last check found nothing. The last reap is also persisted
 
 ### Menu items
 
-- **Clean Up Mac…** (⌘U): see [Clean Up](#clean-up).
+- **Speed Up Mac…** (⌘U) and **Free Up Disk Space…** (⌘D): see above.
+- **Warn Before It Slows Down**: the `health.earlyWarning` toggle.
 - **Clear Leaks Automatically**: the `health.autoReap` toggle.
 - **Open at Login**, **Quit Headroom**.
 
@@ -262,33 +263,44 @@ missing terminator, argc larger than the payload, empty argument, bad UTF-8)
 and the option scanner against `--` handling; the parser is a kill gate, so it
 fails closed on anything it cannot read.
 
-## Clean Up
+## Speed Up Mac, Free Up Disk Space, and the early warning
 
-The menu has one action, **Clean Up Mac…** (⌘U), which is also the big button
-under the MAC rows. The button turns orange or red and names the problem when
-memory, load or disk is in trouble. One click clears the leaks the reaper
-already owns (at any age while memory is low), then opens one window:
+Two actions, because they answer different needs. Memory and CPU go wrong
+within minutes, so that is the daily one. Disk is maintenance, every few weeks.
 
-- **Memory before → now** in large numbers, plus disk free and load, measured
-  again after every action and on Recheck.
-- Five sections, each with one sentence on when it matters:
-  **Claude Code sessions** (folder, age, keyboard idle time, tmux session;
-  detached or 3 h idle are suggested; Close kills the tmux pane, or SIGTERM),
-  **heavy jobs** (Xcode builds and tests, ffmpeg, booted simulators; busy ones
-  suggested), **apps** over 300 MB (Quit, so they can ask to save),
-  **background processes** over 800 MB started by launchd (never suggested),
-  and **disk space** (a fixed list of rebuildable caches, suggested while the
-  disk is under 50 GB free; sizes arrive after a few seconds).
-- **Clean Up N Suggested** acts on the suggested rows only. Nothing else runs
-  without a click on its row. A second click on a survivor forces it.
+**Speed Up Mac…** (⌘U, the big button under the MAC rows, red or orange when
+memory, load or the Claude stack is in trouble). One click clears the leaks the
+reaper already owns (any age while memory is low), then opens a window with
+memory before → now in large numbers and four sections, each opening with one
+sentence on when it matters: **Claude Code sessions** (folder, age, keyboard
+idle time, tmux session; detached or 3 h idle are suggested; Close kills the
+tmux pane, or SIGTERM), **heavy jobs** (Xcode builds and tests, ffmpeg, booted
+simulators; busy ones suggested), **apps** over 300 MB (Quit, so they can ask
+to save), and **background processes** over 800 MB started by launchd (never
+suggested). Memory is re-measured after every action and on Recheck.
+
+**Free Up Disk Space…** (⌘D, the small Disk Space button). Disk before → now
+and a fixed list of caches that rebuild themselves: uv, Codex, Playwright,
+Adobe Camera Raw, pip, npm, Homebrew downloads. Suggested at 1 GB or more, or
+all of them while the disk is under 50 GB. It never touches a process.
+
+**Warn Before It Slows Down** (on by default, `health.earlyWarning`). Every
+30 s sample goes into a 10-minute trend. A notification goes out when memory is
+at 40% free or less and falling fast enough to reach the critical line (15%)
+within about 10 minutes, or when swap grows by 1.5 GB in 5 minutes with memory
+under 50% free. At most one every 20 minutes. The older "Mac is slowing down"
+notice still fires once memory is critical. Under 20 GB of free disk a "Disk
+almost full" reminder goes out, at most once a day. Clicking any of them opens
+the matching window.
 
 Every signal re-checks pid and start time (jobs: the full command line) and is
-logged to `~/.claude-mem/hygiene.log`. The rest of the menu: **Clear Leaks
-Automatically** (the 30-second reaper, with the burst rule), Open at Login,
-Quit. Refresh is the button in the panel footer (⌘R still works).
+logged to `~/.claude-mem/hygiene.log`. The rest of the menu: Clear Leaks
+Automatically (the 30-second reaper, with the burst rule), Open at Login, Quit.
+Refresh is the button in the panel footer (⌘R still works).
 
-Debug: `--relief-dry-run`, `--relief-snapshot out.png`, `--relief-window
-[--dark]`. The icon is drawn by `swift tools/make-icon.swift`.
+Debug: `--relief-dry-run`, `--relief-snapshot out.png [--disk]`,
+`--relief-window [--disk] [--dark]`. The early-warning rules have fixtures in
+`--argv-selftest`. The icon is drawn by `swift tools/make-icon.swift`.
 
 ## Rate limiting
 

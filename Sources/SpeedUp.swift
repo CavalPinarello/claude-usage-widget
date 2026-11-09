@@ -43,6 +43,8 @@ enum SpeedUp {
         ("Playwright browsers", home + "/Library/Caches/ms-playwright", false),
         ("Adobe Camera Raw cache", home + "/Library/Caches/Adobe Camera Raw 2", false),
         ("pip cache", home + "/Library/Caches/pip", false),
+        ("npm cache", home + "/.npm/_cacache", false),
+        ("Homebrew downloads", home + "/Library/Caches/Homebrew", false),
     ]}
 
     static let minCacheBytes: UInt64 = 100 << 20     // smaller ones are not worth a line

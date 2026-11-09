@@ -580,6 +580,8 @@ enum HealthPrefs {
     static let emergencyAgeKey = "health.emergencySummarizerAgeMin"
     static let pollSecondsKey = "health.pollSeconds"
     static let burstMaxKey = "health.summarizerBurstMax"
+    static let earlyWarningKey = "health.earlyWarning"
+    static let lastDiskNoticeKey = "health.lastDiskNotice"
     static let lastReapKey = "health.lastReapJSON"
 
     private static let registered: Void = {
@@ -590,6 +592,7 @@ enum HealthPrefs {
             chromeMaxAgeKey: 60,
             pollSecondsKey: 30,
             burstMaxKey: 10,
+            earlyWarningKey: true,
         ])
     }()
     private static var defaults: UserDefaults { _ = registered; return .standard }
@@ -614,6 +617,16 @@ enum HealthPrefs {
     /// extras are reaped whatever their age. After a reboot the worker started
     /// 25 in one minute (about 12 GB) and none was old enough for the age rule.
     /// 0 turns the rule off.
+    /// Notify before the Mac slows down (trend watcher, see EarlyWarning).
+    static var earlyWarning: Bool {
+        get { defaults.bool(forKey: earlyWarningKey) }
+        set { defaults.set(newValue, forKey: earlyWarningKey) }
+    }
+    static var lastDiskNotice: Date? {
+        get { defaults.object(forKey: lastDiskNoticeKey) as? Date }
+        set { defaults.set(newValue, forKey: lastDiskNoticeKey) }
+    }
+
     static var summarizerBurstMax: Int { max(0, defaults.integer(forKey: burstMaxKey)) }
 
     static var pollSeconds: TimeInterval {
@@ -1004,12 +1017,24 @@ enum HealthNotifier {
         Bundle.main.bundleIdentifier != nil && Bundle.main.bundleURL.pathExtension == "app"
     }
 
+    /// Called on the main thread when a notification posted with `opens` is
+    /// clicked: "speed" or "disk".
+    static var onOpen: ((String) -> Void)?
+
     private final class Presenter: NSObject, UNUserNotificationCenterDelegate {
         static let shared = Presenter()
         func userNotificationCenter(_ center: UNUserNotificationCenter,
                                     willPresent notification: UNNotification,
                                     withCompletionHandler handler: @escaping (UNNotificationPresentationOptions) -> Void) {
             handler([.banner, .list])      // show even while our menu is open
+        }
+        func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                    didReceive response: UNNotificationResponse,
+                                    withCompletionHandler handler: @escaping () -> Void) {
+            if let target = response.notification.request.content.userInfo["opens"] as? String {
+                DispatchQueue.main.async { HealthNotifier.onOpen?(target) }
+            }
+            handler()
         }
     }
 
@@ -1021,7 +1046,7 @@ enum HealthNotifier {
     }
 
     /// `outcome` is for the debug flag only: what path the notification took.
-    static func post(title: String, body: String, outcome: ((String) -> Void)? = nil) {
+    static func post(title: String, body: String, opens: String? = nil, outcome: ((String) -> Void)? = nil) {
         guard hasBundle else {
             legacyPost(title: title, body: body)
             outcome?("no app bundle: legacy NSUserNotification")
@@ -1030,6 +1055,7 @@ enum HealthNotifier {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
+        if let opens = opens { content.userInfo = ["opens": opens] }
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req) { error in
             if let error = error {
@@ -1053,6 +1079,46 @@ enum HealthNotifier {
               let center = centerClass.perform(sel)?.takeUnretainedValue() as? NSObject
         else { return }
         _ = center.perform(NSSelectorFromString("deliverNotification:"), with: note)
+    }
+}
+
+// MARK: - Early warning (added 2026-11-09)
+
+/// Warns before the Mac slows down, from the trend rather than the level: the
+/// critical notice only fires once memory is already under 15% free, which is
+/// when the machine is already stuttering. Two signals, over the last 5 minutes:
+///   - memory free falling fast enough to reach the critical line within
+///     about 10 minutes (and already at 40% or less),
+///   - swap growing by 1.5 GB or more while memory is under 50% free.
+/// Pure function of the samples so the self-test can feed it fixtures.
+struct TrendPoint { let at: Date; let freePct: Int; let swapUsed: UInt64? }
+
+enum EarlyWarning {
+    static let window: TimeInterval = 300
+    static let minSpan: TimeInterval = 90
+    static let watchPct = 40
+    static let horizonMin = 10.0
+    static let swapGrowth: UInt64 = 1536 << 20
+
+    static func check(_ points: [TrendPoint], now: Date = Date()) -> String? {
+        let recent = points.filter { now.timeIntervalSince($0.at) <= window }.sorted { $0.at < $1.at }
+        guard let first = recent.first, let last = recent.last, recent.count >= 3,
+              last.at.timeIntervalSince(first.at) >= minSpan,
+              last.freePct >= HealthScorer.memCriticalPct else { return nil }
+        let minutes = last.at.timeIntervalSince(first.at) / 60
+        let slope = Double(last.freePct - first.freePct) / minutes         // points per minute
+        if last.freePct <= watchPct, slope < 0 {
+            let eta = Double(last.freePct - HealthScorer.memCriticalPct) / -slope
+            if eta <= horizonMin {
+                let rate = max(1, Int((-slope).rounded()))
+                let when = eta < 1.5 ? "within a minute or two" : "in about \(Int(eta.rounded())) minutes"
+                return "Memory is \(last.freePct)% free and falling about \(rate) point\(rate == 1 ? "" : "s") a minute. At this pace it runs out \(when)."
+            }
+        }
+        if last.freePct < 50, let s0 = first.swapUsed, let s1 = last.swapUsed, s1 > s0, s1 - s0 >= swapGrowth {
+            return "Swap grew by \(Style.bytes(s1 - s0)) in \(max(1, Int(minutes.rounded()))) minutes with memory \(last.freePct)% free. The Mac starts to stutter soon after this."
+        }
+        return nil
     }
 }
 
@@ -1086,6 +1152,8 @@ final class HealthMonitor {
     private var lastPressureNotice = Date.distantPast
     private var lastPressureRun = Date.distantPast
     private var sessionReap: ReapResult?
+    private var trend: [TrendPoint] = []           // last 10 min of samples
+    private var lastEarlyWarning = Date.distantPast
 
     func start() {
         guard !started else { return }
@@ -1180,7 +1248,33 @@ final class HealthMonitor {
             if let oldest = sample.claude.oldestSession, oldest.age > 86_400 {
                 body += ", oldest \(Style.duration(oldest.age))"
             }
-            HealthNotifier.post(title: "Mac under pressure", body: body)
+            HealthNotifier.post(title: "Mac is slowing down", body: body + ". Click to see what is using it.",
+                                opens: "speed")
+        }
+
+        // Early warning: the trend says it is about to happen.
+        if let free = sample.memFreePct {
+            trend.append(TrendPoint(at: sample.sampledAt, freePct: free, swapUsed: sample.swap?.usedBytes))
+            trend.removeAll { sample.sampledAt.timeIntervalSince($0.at) > 600 }
+        }
+        if HealthPrefs.earlyWarning, assessment.level != .critical,
+           Date().timeIntervalSince(lastEarlyWarning) > 20 * 60,
+           Date().timeIntervalSince(lastPressureNotice) > 20 * 60,
+           let message = EarlyWarning.check(trend, now: sample.sampledAt) {
+            lastEarlyWarning = Date()
+            HealthAction.log("early warning: \(message)")
+            HealthNotifier.post(title: "Mac is about to slow down", body: message + " Click to see what is using it.",
+                                opens: "speed")
+        }
+
+        // Disk: a maintenance reminder, at most once a day, only when it is
+        // low enough to slow the Mac (swap lives on the same disk).
+        if let d = sample.disk, d.freeBytes < HealthScorer.diskCriticalBytes,
+           Date().timeIntervalSince(HealthPrefs.lastDiskNotice ?? .distantPast) > 86_400 {
+            HealthPrefs.lastDiskNotice = Date()
+            HealthNotifier.post(title: "Disk almost full",
+                                body: "\(Style.bytes(d.freeBytes)) free. Below 20 GB macOS runs short of room for swap and the Mac slows down. Click to clear caches.",
+                                opens: "disk")
         }
 
         let published = HealthPanelState(assessment: assessment, suspected: suspected,
@@ -1387,6 +1481,27 @@ enum HealthDebug {
                                      kernelPressure: nil, sampledAt: now, claude: stack, sampleMillis: 0,
                                      validity: Validity(memory: true, vm: false, swap: false, load: false))
             cases.append(("burst rule: \(max) young summarizers, none reaped", HealthAction.targets(in: quiet).summarizers.isEmpty))
+        }
+
+        // Early warning fixtures: one point every 30 s for 5 minutes.
+        do {
+            let now = Date()
+            func series(_ free: (Int) -> Int, swapGB: (Int) -> Double = { _ in 4 }) -> [TrendPoint] {
+                (0...10).map { i in TrendPoint(at: now.addingTimeInterval(Double(i - 10) * 30), freePct: free(i),
+                                               swapUsed: UInt64(swapGB(i) * 1_073_741_824)) }
+            }
+            cases.append(("early warning: 60% to 30% in 5 min warns",
+                          EarlyWarning.check(series { 60 - $0 * 3 }, now: now) != nil))
+            cases.append(("early warning: steady at 30% is quiet",
+                          EarlyWarning.check(series { _ in 30 }, now: now) == nil))
+            cases.append(("early warning: slow drift 34% to 31% is quiet",
+                          EarlyWarning.check(series { 34 - $0 * 3 / 10 }, now: now) == nil))
+            cases.append(("early warning: swap +2.5 GB at 45% free warns",
+                          EarlyWarning.check(series({ _ in 45 }, swapGB: { 4 + Double($0) * 0.25 }), now: now) != nil))
+            cases.append(("early warning: already critical (12%) leaves it to the critical notice",
+                          EarlyWarning.check(series { 30 - $0 * 18 / 10 }, now: now) == nil))
+            cases.append(("early warning: two points are not a trend",
+                          EarlyWarning.check(Array(series { 60 - $0 * 3 }.suffix(2)), now: now) == nil))
         }
 
         var failures = 0

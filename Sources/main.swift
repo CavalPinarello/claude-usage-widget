@@ -491,11 +491,14 @@ final class PanelView: NSView {
     var healthState = HealthPanelState() { didSet { invalidateIntrinsicContentSize(); needsDisplay = true; styleFreeButton() } }
     private var health: HealthAssessment? { healthState.assessment }
 
-    // Clean Up: a real button under the MAC rows (menu item views pass clicks
-    // to their controls). Tinted by the Mac's state: red critical, orange warn.
+    // Two real buttons under the MAC rows (menu item views pass clicks to their
+    // controls): Speed Up for memory and CPU, the daily one, tinted by those;
+    // Disk for maintenance, tinted only by the disk.
     private let freeRowH: CGFloat = 42
-    let freeButton = NSButton(title: "Clean Up Mac", target: nil, action: nil)
+    let freeButton = NSButton(title: "Speed Up Mac", target: nil, action: nil)
     var onFreeMemory: (() -> Void)?
+    let diskButton = NSButton(title: "Disk Space", target: nil, action: nil)
+    var onDisk: (() -> Void)?
     // Refresh lives in the footer, next to the time it changes.
     let refreshButton = NSButton(title: "Refresh", target: nil, action: nil)
     var onRefresh: (() -> Void)?
@@ -508,8 +511,17 @@ final class PanelView: NSView {
         freeButton.target = self
         freeButton.action = #selector(freeClicked)
         freeButton.isHidden = true
-        freeButton.toolTip = "Clears leaked background processes now, then shows what else is slowing the Mac."
+        freeButton.toolTip = "Clears leaked background processes now, then shows the sessions, jobs and apps holding memory."
         addSubview(freeButton)
+
+        diskButton.bezelStyle = .rounded
+        diskButton.controlSize = .large
+        diskButton.font = .systemFont(ofSize: 13, weight: .regular)
+        diskButton.target = self
+        diskButton.action = #selector(diskClicked)
+        diskButton.isHidden = true
+        diskButton.toolTip = "Maintenance: clears caches that rebuild themselves. Worth it every few weeks."
+        addSubview(diskButton)
 
         refreshButton.isBordered = false
         refreshButton.font = .systemFont(ofSize: 10.5, weight: .medium)
@@ -530,22 +542,30 @@ final class PanelView: NSView {
     static let appIcon: NSImage? = Bundle.main.image(forResource: "AppIcon")
 
     @objc private func freeClicked() { onFreeMemory?() }
+    @objc private func diskClicked() { onDisk?() }
     @objc private func refreshClicked() { onRefresh?() }
 
     private func styleFreeButton() {
         freeButton.isHidden = health == nil
-        let lvl = health?.level ?? .ok
-        var title = "Clean Up Mac"
-        if lvl != .ok, let top = health?.reasons.first { title += "  \u{00B7}  " + top }
-        freeButton.title = title
+        diskButton.isHidden = health == nil
+        // Speed Up follows memory, load and the Claude stack; disk has its own button.
+        // Quiet until the overall level (after hysteresis) moves off ok, like the rows.
+        let speedReasons = health.map { h in h.level == .ok ? [] : h.details.filter { $0.metric != .disk && $0.level != .ok } } ?? []
+        let lvl = speedReasons.map(\.level).max() ?? .ok
+        // The red or orange MAC header right above already names the problem.
+        freeButton.title = "Speed Up Mac"
         freeButton.bezelColor = lvl == .critical ? .systemRed : lvl == .warn ? .systemOrange : nil
+        let disk = health?.level(for: .disk) ?? .ok
+        diskButton.bezelColor = disk == .critical ? .systemRed : disk == .warn ? .systemOrange : nil
         needsLayout = true
     }
 
     override func layout() {
         super.layout()
         // The row sits right above the footer, which is where the MAC section ends.
-        freeButton.frame = NSRect(x: pad, y: pad + 24 + 6, width: bounds.width - pad * 2, height: 32)
+        let diskW: CGFloat = 92
+        freeButton.frame = NSRect(x: pad, y: pad + 24 + 6, width: bounds.width - pad * 2 - diskW - 8, height: 32)
+        diskButton.frame = NSRect(x: bounds.width - pad - diskW, y: pad + 24 + 6, width: diskW, height: 32)
         refreshButton.frame = NSRect(x: bounds.width - pad - 80, y: pad + 3, width: 80, height: 16)
     }
 
@@ -815,7 +835,7 @@ final class PanelView: NSView {
                 title: "Disk",
                 value: "\(Style.bytes(d.freeBytes)) free",
                 sub: "\(usedPct)% used of \(Style.bytes(d.totalBytes))"
-                    + (h.level(for: .disk) == .ok ? "" : " \u{00B7} Clean Up can clear caches"),
+                    + (h.level(for: .disk) == .ok ? "" : " \u{00B7} Disk Space clears caches"),
                 level: h.level(for: .disk))
         }
 
@@ -977,6 +997,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var snapshot = Snapshot()
     private var loginToggle: NSMenuItem!
     private var autoReapToggle: NSMenuItem!
+    private var warnToggle: NSMenuItem!
     private var wakeObserver: NSObjectProtocol?
 
     // Mac health: its own poll timer (health.pollSeconds, default 30 s), the
@@ -994,11 +1015,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildMenu()
         statusItem.menu = menu
         panel.onFreeMemory = { [weak self] in self?.freeMemory() }
+        panel.onDisk = { [weak self] in self?.openDisk() }
+        // A click on a warning notification opens the window it names.
+        HealthNotifier.onOpen = { [weak self] target in
+            target == "disk" ? self?.openDisk() : self?.freeMemory()
+        }
         panel.onRefresh = { [weak self] in self?.refresh(force: true) }
         // Debug: open Clean Up at launch (for screenshots of the live window).
         if CommandLine.arguments.contains("--relief-window") {
             if CommandLine.arguments.contains("--dark") { NSApp.appearance = NSAppearance(named: .darkAqua) }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.freeMemory() }
+            let disk = CommandLine.arguments.contains("--disk")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                disk ? self?.openDisk() : self?.freeMemory()
+            }
         }
 
         // Health first: it must never wait behind a slow Keychain call.
@@ -1040,11 +1069,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(panelItem)
         menu.addItem(.separator())
 
-        let cleanItem = NSMenuItem(title: "Clean Up Mac\u{2026}", action: #selector(freeMemory), keyEquivalent: "u")
-        cleanItem.target = self
-        cleanItem.image = NSImage(systemSymbolName: "gauge.with.dots.needle.67percent", accessibilityDescription: nil)
-        cleanItem.toolTip = "Clears leaked background processes now, then shows sessions, apps, jobs and caches you can close."
-        menu.addItem(cleanItem)
+        let speedItem = NSMenuItem(title: "Speed Up Mac\u{2026}", action: #selector(freeMemory), keyEquivalent: "u")
+        speedItem.target = self
+        speedItem.image = NSImage(systemSymbolName: "gauge.with.dots.needle.67percent", accessibilityDescription: nil)
+        speedItem.toolTip = "For a slow Mac: clears leaked processes now, then shows the sessions, jobs and apps holding memory."
+        menu.addItem(speedItem)
+
+        let diskItem = NSMenuItem(title: "Free Up Disk Space\u{2026}", action: #selector(openDisk), keyEquivalent: "d")
+        diskItem.target = self
+        diskItem.image = NSImage(systemSymbolName: "internaldrive", accessibilityDescription: nil)
+        diskItem.toolTip = "Maintenance: clears caches that rebuild themselves. Worth it every few weeks."
+        menu.addItem(diskItem)
         menu.addItem(.separator())
 
         // ⌘R still works while the menu is open; the visible control is the
@@ -1054,6 +1089,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshItem.isHidden = true
         refreshItem.allowsKeyEquivalentWhenHidden = true
         menu.addItem(refreshItem)
+
+        warnToggle = NSMenuItem(title: "Warn Before It Slows Down", action: #selector(toggleWarn), keyEquivalent: "")
+        warnToggle.target = self
+        warnToggle.toolTip = "Watches how fast memory falls and swap grows, and sends a notification a few minutes before the Mac starts to stutter."
+        menu.addItem(warnToggle)
 
         autoReapToggle = NSMenuItem(title: "Clear Leaks Automatically", action: #selector(toggleAutoReap),
                                     keyEquivalent: "")
@@ -1075,6 +1115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         loginToggle.state = LoginItem.isEnabled ? .on : .off
         autoReapToggle.state = HealthPrefs.autoReap ? .on : .off
+        warnToggle.state = HealthPrefs.earlyWarning ? .on : .off
         panel.frame = NSRect(origin: .zero, size: panel.intrinsicContentSize)
         panel.needsDisplay = true
         refresh()
@@ -1086,15 +1127,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func refreshNow() { refresh(force: true) }
 
-    /// One click: clears the leaks at once, then opens the Clean Up window,
-    /// which lists what else slows the Mac and measures again after each close.
+    /// One click: clears the leaks at once, then opens Speed Up Mac, which
+    /// lists what else holds memory and measures again after each close.
     @objc private func freeMemory() {
         menu.cancelTracking()
         let low = (health?.level(for: .memory) ?? .ok) != .ok
         // Let the menu finish closing before a window takes focus.
         DispatchQueue.main.async { [weak self] in
-            Relief.open(lowMemory: low) { self?.healthMonitor.poll() }
+            Relief.open(.speed, lowMemory: low) { self?.healthMonitor.poll() }
         }
+    }
+
+    /// Maintenance: the rebuildable caches, disk before and now.
+    @objc private func openDisk() {
+        menu.cancelTracking()
+        DispatchQueue.main.async { [weak self] in
+            Relief.open(.disk) { self?.healthMonitor.poll() }
+        }
+    }
+
+    @objc private func toggleWarn() {
+        HealthPrefs.earlyWarning.toggle()
+        warnToggle.state = HealthPrefs.earlyWarning ? .on : .off
     }
 
     @objc private func toggleAutoReap() {
@@ -1259,7 +1313,8 @@ if CommandLine.arguments.contains("--relief-dry-run") {
 if let i = CommandLine.arguments.firstIndex(of: "--relief-snapshot"),
    CommandLine.arguments.count > i + 1 {
     NSApplication.shared.setActivationPolicy(.prohibited)
-    ReliefWindow.snapshot(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
+    ReliefWindow.snapshot(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]),
+                          mode: CommandLine.arguments.contains("--disk") ? .disk : .speed)
     exit(0)
 }
 
@@ -1401,7 +1456,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
         view.draw(rect)
         // The buttons are subviews; draw() alone leaves them out.
         view.layout()
-        for btn in [view.freeButton, view.refreshButton] where !btn.isHidden {
+        for btn in [view.freeButton, view.diskButton, view.refreshButton] where !btn.isHidden {
             guard let rep = btn.bitmapImageRepForCachingDisplay(in: btn.bounds) else { continue }
             btn.cacheDisplay(in: btn.bounds, to: rep)
             rep.draw(in: btn.frame)

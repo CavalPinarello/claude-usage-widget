@@ -1,7 +1,13 @@
 import Cocoa
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Clean Up (added 2026-11-09 as Free Up Memory; Speed Up folded in the same day)
+// Speed Up Mac and Free Up Disk Space (2026-11-09)
+//
+// Two windows from one class, split because they answer different needs:
+// memory and CPU go wrong within minutes (a daily job), while disk is
+// maintenance done every few weeks. Free Up Disk Space lists only the
+// rebuildable caches and measures disk before and now; it never touches a
+// process. Everything below describes Speed Up unless it says disk.
 //
 // The one place to make the Mac fast again. On 2026-11-09, six minutes after
 // a reboot, the claude-mem worker started 25 summarizers inside one minute
@@ -38,11 +44,12 @@ enum Relief {
         let swapUsed: UInt64?
         let compressed: UInt64?
         let diskFree: UInt64?
+        var diskTotal: UInt64? = nil
         let loadPerCore: Double?
         let at: Date
         init(_ s: HealthSample) {
             freePct = s.memFreePct; swapUsed = s.swap?.usedBytes
-            compressed = s.vm?.compressedBytes; diskFree = s.disk?.freeBytes
+            compressed = s.vm?.compressedBytes; diskFree = s.disk?.freeBytes; diskTotal = s.disk?.totalBytes
             loadPerCore = s.loadPerCore; at = s.sampledAt
         }
         init(freePct: Int?, swapUsed: UInt64?, compressed: UInt64?, diskFree: UInt64?, loadPerCore: Double?, at: Date) {
@@ -160,6 +167,11 @@ enum Relief {
         return panes
     }
 
+    enum Mode { case speed, disk
+        var title: String { self == .speed ? "Speed Up Mac" : "Free Up Disk Space" }
+        var sections: [Section] { self == .speed ? [.sessions, .heavy, .apps, .background] : [.disk] }
+    }
+
     // MARK: Candidates
 
     enum Section: Int, CaseIterable {
@@ -185,7 +197,7 @@ enum Relief {
             case .background:
                 return "Servers and tools started outside any app. Stop one only if you won't need it in the next hour."
             case .disk:
-                return "Caches that rebuild themselves when next needed. Clear them when the disk is nearly full, since macOS keeps swap on the same disk."
+                return "Folders that rebuild themselves the next time a tool needs them. The only cost is a slower first run afterwards."
             }
         }
     }
@@ -365,13 +377,16 @@ enum Relief {
         }
     }
 
-    /// Rebuildable caches as rows; suggested only while the disk is low.
+    /// Rebuildable caches as rows. Suggested when 1 GB or more, or any size
+    /// while the disk is low.
     static func caches(diskLow: Bool) -> [Candidate] {
         SpeedUp.gatherCaches().map { c in
-            Candidate(id: "cache-" + c.path, section: .disk, title: c.name,
-                      detail: SpeedUp.abbreviate(c.path), bytes: c.bytes ?? 0,
-                      metric: c.bytes == nil ? "not measured" : nil,
-                      suggested: diskLow ? "The disk is nearly full." : nil, warning: nil, action: .clearCache(c))
+            let big = (c.bytes ?? 0) >= 1 << 30
+            return Candidate(id: "cache-" + c.path, section: .disk, title: c.name,
+                             detail: SpeedUp.abbreviate(c.path), bytes: c.bytes ?? 0,
+                             metric: c.bytes == nil ? "not measured" : nil,
+                             suggested: diskLow ? "The disk is nearly full." : big ? "Over a gigabyte that will rebuild itself." : nil,
+                             warning: nil, action: .clearCache(c))
         }
     }
 
@@ -441,18 +456,25 @@ enum Relief {
 
     // MARK: Entry point
 
-    static func open(lowMemory: Bool, onChange: @escaping () -> Void) {
-        if let w = ReliefWindow.current {
+    static func open(_ mode: Mode, lowMemory: Bool = false, onChange: @escaping () -> Void) {
+        if let w = ReliefWindow.open[mode] {
             NSApp.activate(ignoringOtherApps: true)
             w.window?.makeKeyAndOrderFront(nil)
             w.recheck()
+            if mode == .disk { w.measureCaches() }
             return
         }
-        let w = ReliefWindow(onChange: onChange)
-        ReliefWindow.current = w
+        let w = ReliefWindow(mode: mode, onChange: onChange)
+        ReliefWindow.open[mode] = w
         w.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
         w.window?.makeKeyAndOrderFront(nil)
+        if mode == .disk {
+            w.status = "Measuring the caches. Worth a look every few weeks, or when the disk drops under 50 GB."
+            w.recheck()
+            w.measureCaches()
+            return
+        }
         clearLeaks(lowMemory: lowMemory) { result, before in
             DispatchQueue.main.async {
                 w.baseline = Reading(before)
@@ -464,7 +486,6 @@ enum Relief {
                 }
                 onChange()
                 w.recheck(after: result.killedAnything ? 2 : 0)
-                w.measureCaches()
             }
         }
     }
@@ -491,7 +512,8 @@ enum Relief {
 
 final class ReliefWindow: NSWindowController, NSWindowDelegate {
 
-    static var current: ReliefWindow?
+    static var open: [Relief.Mode: ReliefWindow] = [:]
+    let mode: Relief.Mode
 
     var baseline: Relief.Reading?
     var latest: Relief.Reading?
@@ -521,13 +543,14 @@ final class ReliefWindow: NSWindowController, NSWindowDelegate {
 
     private var rows: [Relief.Candidate] { Relief.sorted(candidates + cacheRows) }
 
-    init(onChange: @escaping () -> Void, demo: Bool = false) {
+    init(mode: Relief.Mode, onChange: @escaping () -> Void, demo: Bool = false) {
+        self.mode = mode
         self.onChange = onChange
         self.demo = demo
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: ReliefWindow.width, height: 640),
                            styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
                            backing: .buffered, defer: false)
-        win.title = "Clean Up Mac"
+        win.title = mode.title
         win.titlebarAppearsTransparent = true
         win.isReleasedWhenClosed = false
         win.minSize = NSSize(width: ReliefWindow.width, height: 420)
@@ -540,7 +563,7 @@ final class ReliefWindow: NSWindowController, NSWindowDelegate {
     required init?(coder: NSCoder) { fatalError("not used") }
 
     func windowWillClose(_ notification: Notification) {
-        if ReliefWindow.current === self { ReliefWindow.current = nil }
+        if ReliefWindow.open[mode] === self { ReliefWindow.open[mode] = nil }
     }
 
     // MARK: Layout
@@ -571,8 +594,9 @@ final class ReliefWindow: NSWindowController, NSWindowDelegate {
         let arrow = NSImageView(image: NSImage(systemSymbolName: "arrow.right", accessibilityDescription: "to") ?? NSImage())
         arrow.symbolConfiguration = .init(pointSize: 18, weight: .medium)
         arrow.contentTintColor = .tertiaryLabelColor
-        let readout = NSStackView(views: [column("Memory before", beforeValue, beforeSub), arrow,
-                                          column("Memory now", nowValue, nowSub)])
+        let what = mode == .speed ? "Memory" : "Disk"
+        let readout = NSStackView(views: [column("\(what) before", beforeValue, beforeSub), arrow,
+                                          column("\(what) now", nowValue, nowSub)])
         readout.orientation = .horizontal; readout.alignment = .centerY; readout.spacing = 24
 
         machineLine.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
@@ -607,7 +631,8 @@ final class ReliefWindow: NSWindowController, NSWindowDelegate {
         for b in [suggestedButton, recheckButton, done, monitor] { b.bezelStyle = .rounded; b.controlSize = .large }
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let buttons = NSStackView(views: [monitor, spacer, recheckButton, done, suggestedButton])
+        let leading: [NSView] = mode == .speed ? [monitor] : []
+        let buttons = NSStackView(views: leading + [spacer, recheckButton, done, suggestedButton])
         buttons.orientation = .horizontal; buttons.spacing = 8
 
         let sep1 = NSBox(); sep1.boxType = .separator
@@ -659,6 +684,10 @@ final class ReliefWindow: NSWindowController, NSWindowDelegate {
 
     private func describe(_ r: Relief.Reading?) -> (String, String) {
         guard let r = r else { return ("\u{2013}", "measuring\u{2026}") }
+        if mode == .disk {
+            let v = r.diskFree.map { "\(Style.bytes($0)) free" } ?? "unknown"
+            return (v, r.diskTotal.map { "of \(Style.bytes($0))" } ?? "")
+        }
         let v = r.freePct.map { "\($0)% free" } ?? "unknown"
         var sub: [String] = []
         if let s = r.swapUsed { sub.append("swap \(Style.bytes(s))") }
@@ -670,12 +699,23 @@ final class ReliefWindow: NSWindowController, NSWindowDelegate {
         let b = describe(baseline), n = describe(latest)
         beforeValue.stringValue = b.0; beforeSub.stringValue = b.1
         nowValue.stringValue = n.0; nowSub.stringValue = n.1
-        beforeValue.textColor = baseline.map { Style.tint(forHealth: $0.level) } ?? .labelColor
-        nowValue.textColor = latest.map { $0.level == .ok ? .systemGreen : Style.tint(forHealth: $0.level) } ?? .labelColor
+        func color(_ r: Relief.Reading, now: Bool) -> NSColor {
+            let lvl: HealthLevel = mode == .speed ? r.level
+                : (r.diskFree ?? .max) < HealthScorer.diskCriticalBytes ? .critical : r.diskLow ? .warn : .ok
+            return lvl == .ok ? (now ? .systemGreen : .labelColor) : Style.tint(forHealth: lvl)
+        }
+        beforeValue.textColor = baseline.map { color($0, now: false) } ?? .labelColor
+        nowValue.textColor = latest.map { color($0, now: true) } ?? .labelColor
         var parts: [String] = []
         if let r = latest ?? baseline {
-            if let d = r.diskFree { parts.append("Disk \(Style.bytes(d)) free" + (r.diskLow ? " (low)" : "")) }
-            if let l = r.loadPerCore { parts.append(String(format: "load %.1f per core", l)) }
+            if mode == .speed {
+                if let l = r.loadPerCore { parts.append(String(format: "Load %.1f per core", l)) }
+                if let d = r.diskFree, d < HealthScorer.diskCriticalBytes {
+                    parts.append("disk \(Style.bytes(d)) free, low enough to slow swap")
+                }
+            } else if let f = r.freePct {
+                parts.append("Memory \(f)% free")
+            }
             parts.append("checked \(Style.clock(r.at))")
         }
         machineLine.stringValue = parts.joined(separator: "  \u{00B7}  ")
@@ -686,14 +726,16 @@ final class ReliefWindow: NSWindowController, NSWindowDelegate {
         let width = ReliefWindow.width - 48
         let all = rows
         if all.isEmpty && !cachesMeasuring {
-            let l = NSTextField(wrappingLabelWithString: scanning ? "Measuring what holds memory\u{2026}"
-                : "Nothing else is worth closing. Sessions, heavy jobs, apps over 300 MB, background processes over 800 MB and big caches appear here.")
+            let empty = mode == .speed
+                ? "Nothing else is worth closing. Sessions, heavy jobs, apps over 300 MB and background processes over 800 MB appear here."
+                : "No cache is big enough to bother with. Caches over 100 MB from uv, Codex, Playwright, Camera Raw, pip, npm and Homebrew appear here."
+            let l = NSTextField(wrappingLabelWithString: scanning && mode == .speed ? "Measuring what holds memory\u{2026}" : empty)
             l.font = .systemFont(ofSize: 12.5); l.textColor = .secondaryLabelColor
             l.preferredMaxLayoutWidth = width
             list.addArrangedSubview(l)
             list.setCustomSpacing(10, after: l)
         }
-        for section in Relief.Section.allCases {
+        for section in mode.sections {
             let items = all.filter { $0.section == section }
             let measuringHere = section == .disk && cachesMeasuring && items.isEmpty
             guard !items.isEmpty || measuringHere else { continue }
@@ -712,7 +754,8 @@ final class ReliefWindow: NSWindowController, NSWindowDelegate {
             }
         }
         let n = all.filter { $0.suggested != nil && !working.contains($0.id) }.count
-        suggestedButton.title = n > 0 ? "Clean Up \(n) Suggested" : "Nothing Suggested"
+        let verb = mode == .speed ? "Close" : "Clear"
+        suggestedButton.title = n > 0 ? "\(verb) \(n) Suggested" : "Nothing Suggested"
         suggestedButton.isEnabled = n > 0
         recheckButton.isEnabled = !scanning
     }
@@ -722,7 +765,7 @@ final class ReliefWindow: NSWindowController, NSWindowDelegate {
         title.font = .systemFont(ofSize: 11, weight: .bold)
         title.textColor = .secondaryLabelColor
         let total = items.reduce(UInt64(0)) { $0 + $1.bytes }
-        let amount = NSTextField(labelWithString: total > 0 ? Style.bytes(total) + (s == .disk ? " on disk" : "") : "")
+        let amount = NSTextField(labelWithString: total > 0 ? Style.bytes(total) + (s == .disk ? " in all" : "") : "")
         amount.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
         amount.textColor = .secondaryLabelColor
         let spacer = NSView()
@@ -804,7 +847,7 @@ final class ReliefWindow: NSWindowController, NSWindowDelegate {
         recheckButton.isEnabled = false
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) { [weak self] in
             let sample = HealthSensor.sample()
-            let found = Relief.gather()
+            let found = self?.mode == .speed ? Relief.gather() : []
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.scanning = false
@@ -852,11 +895,16 @@ final class ReliefWindow: NSWindowController, NSWindowDelegate {
                 for c in list { self.working.remove(c.id); self.attempted.insert(c.id) }
                 self.errors.merge(errs) { $1 }
                 let ok = list.count - errs.count
-                self.status = ok > 0 ? "Done: \(ok) item\(ok == 1 ? "" : "s"). Measuring again once memory settles\u{2026}"
-                                     : "Nothing was closed."
+                if self.mode == .speed {
+                    self.status = ok > 0 ? "Done: \(ok) item\(ok == 1 ? "" : "s"). Measuring again once memory settles\u{2026}"
+                                         : "Nothing was closed."
+                } else {
+                    self.status = ok > 0 ? "Cleared \(ok) cache\(ok == 1 ? "" : "s"). They come back as the tools need them."
+                                         : "Nothing was cleared."
+                }
                 self.renderList()
                 // Apps may show a save prompt; memory takes a moment to come back.
-                self.recheck(after: 3)
+                self.recheck(after: self.mode == .speed ? 3 : 0.5)
                 if touchedDisk {
                     self.cacheRows.removeAll { c in list.contains { $0.id == c.id } && errs[c.id] == nil }
                     self.measureCaches()
@@ -877,7 +925,7 @@ final class ReliefWindow: NSWindowController, NSWindowDelegate {
     @objc private func recheckClicked() {
         status = "Measuring again\u{2026}"
         recheck()
-        measureCaches()
+        if mode == .disk { measureCaches() }
     }
 
     @objc private func doneClicked() { close() }
@@ -888,8 +936,8 @@ final class ReliefWindow: NSWindowController, NSWindowDelegate {
 
     // MARK: Debug: the window filled with the 2026-11-09 situation
 
-    static func demo() -> ReliefWindow {
-        let w = ReliefWindow(onChange: {}, demo: true)
+    static func demo(_ mode: Relief.Mode) -> ReliefWindow {
+        let w = ReliefWindow(mode: mode, onChange: {}, demo: true)
         let now = Date()
         func proc(_ pid: pid_t) -> Relief.Proc {
             Relief.Proc(pid: pid, ppid: 1, startSec: 0, startUsec: 0, path: "", footprint: 0, tdev: 0, started: now)
@@ -931,6 +979,28 @@ final class ReliefWindow: NSWindowController, NSWindowDelegate {
                   action: .clearCache(SpeedUp.Cache(name: "uv", path: home + "/.cache/uv", bytes: 15 << 30, viaUV: true))),
         ]
         w.attempted = ["d"]
+        if mode == .disk {
+            var b = Relief.Reading(freePct: 61, swapUsed: nil, compressed: nil, diskFree: 14 << 30, loadPerCore: nil, at: now.addingTimeInterval(-20))
+            b.diskTotal = 926 << 30
+            var l = Relief.Reading(freePct: 61, swapUsed: nil, compressed: nil, diskFree: 32 << 30, loadPerCore: nil, at: now)
+            l.diskTotal = 926 << 30
+            w.baseline = b; w.latest = l
+            w.status = "Cleared 1 cache. They come back as the tools need them."
+            w.candidates = []
+            w.cacheRows = [
+                .init(id: "p", section: .disk, title: "Playwright browsers", detail: "~/Library/Caches/ms-playwright",
+                      bytes: 2_900 << 20, suggested: "The disk is nearly full.", warning: nil,
+                      action: .clearCache(SpeedUp.Cache(name: "p", path: home + "/x", bytes: 0, viaUV: false))),
+                .init(id: "n", section: .disk, title: "npm cache", detail: "~/.npm/_cacache",
+                      bytes: 1_200 << 20, suggested: "The disk is nearly full.", warning: nil,
+                      action: .clearCache(SpeedUp.Cache(name: "n", path: home + "/x", bytes: 0, viaUV: false))),
+                .init(id: "h", section: .disk, title: "Homebrew downloads", detail: "~/Library/Caches/Homebrew",
+                      bytes: 640 << 20, suggested: "The disk is nearly full.", warning: nil,
+                      action: .clearCache(SpeedUp.Cache(name: "h", path: home + "/x", bytes: 0, viaUV: false))),
+            ]
+        } else {
+            w.cacheRows = []
+        }
         w.scanning = false
         w.renderReadout(); w.renderList()
         return w
@@ -938,11 +1008,11 @@ final class ReliefWindow: NSWindowController, NSWindowDelegate {
 
     /// Offscreen render of the demo window (light only: offscreen captures draw
     /// no window background, so dark text lands on white).
-    static func snapshot(to url: URL) {
-        let w = demo()
+    static func snapshot(to url: URL, mode: Relief.Mode) {
+        let w = demo(mode)
         guard let win = w.window, let view = win.contentView else { return }
         win.appearance = NSAppearance(named: .aqua)
-        win.setContentSize(NSSize(width: ReliefWindow.width, height: 1180))
+        win.setContentSize(NSSize(width: ReliefWindow.width, height: mode == .speed ? 1080 : 560))
         view.layoutSubtreeIfNeeded()
         guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
         view.cacheDisplay(in: view.bounds, to: rep)
